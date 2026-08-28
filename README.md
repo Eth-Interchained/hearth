@@ -70,11 +70,30 @@ Declare four 20 GiB models on a 48 GiB card and no runtime errors. It loads, evi
 
 ## Status
 
-`hearth-core` — state machine, VRAM planner, fleet routing. 33 tests, all pure logic, no GPU required to run them.
+`hearth-core` — state machine, VRAM planner, fleet routing. Pure logic, no GPU required.
+`hearth-resolve` — one reference syntax over the Ollama registry and HuggingFace GGUFs, verified against the live registries.
+`hearth-store` — **the NEDB spine.** Every residency transition is a bi-temporal, causally-linked, tamper-evident event in an embedded [NEDB](https://github.com/Eth-Interchained/nedb). Not a log on the side: the supervisor's memory IS the database.
+`hearth-serve` — the supervisor. `llama-server` children, honest health probes, `gpu_present` via nvidia-smi (an honest `None` on CPU boxes), SIGTERM records `unloaded` and reaps children. Plus the `hearth` CLI.
 
-Next: supervisor over `llama-server` children · NVML probe · HTTP surface (OpenAI-compatible + `/residency`) · CLI · napi + PyO3 bindings · NEDB event log.
+Proven end-to-end on a real model: `hearth serve` brought a GGUF resident under a real `llama-server` (warmup measured, not guessed), served real completion tokens, took a SIGTERM, and a **fresh process** then read the whole story back off disk:
 
-That last one is the interesting one. Every state transition becomes an event in [NEDB](https://github.com/Eth-Interchained/nedb), which is bi-temporal — so *"what was resident **as of** 03:14?"* is a real query against a real causal chain. When a model goes cold at 3am you get the answer instead of a theory.
+```
+$ hearth why stories
+● seq     3  unloaded       {}
+└─ seq     2  resident       {"endpoint":"127.0.0.1:18080","warmup_ms":256}
+└─ seq     1  loading        {"endpoint":"127.0.0.1:18080","pid":10121}
+└─ seq     0  declared       {"admitted":true,"vram_bytes":1073741824}
+
+$ hearth as-of stories 2
+as of seq 2: stories was `resident` {"endpoint":"127.0.0.1:18080","warmup_ms":256}
+
+$ hearth verify
+verify ok — 4 nodes checked, history intact
+```
+
+*What was resident **as of** seq 2* is a real query against a real causal chain. When a model goes cold at 3am you get the answer instead of a theory — and `verify` proves nobody rewrote it. No other serving stack can print that.
+
+Next: `hearth pull` wired to the resolvers + blob store · HTTP surface (OpenAI-compatible proxy + `/residency`) · multi-model fleets under one supervisor · napi + PyO3 bindings for store/serve.
 
 ## Integration
 
@@ -83,8 +102,12 @@ hearth speaks OpenAI-compatible, so [pin-clientd](https://github.com/aiassistsec
 ## Build
 
 ```bash
-cargo test          # 33 tests, no GPU needed
+cargo test --workspace   # no GPU needed
 cargo run --example a6000
+
+# serve a model under supervision (needs llama.cpp's llama-server)
+hearth serve --model muse --gguf ./muse.gguf --port 8080
+hearth status && hearth why muse && hearth verify
 ```
 
 ---

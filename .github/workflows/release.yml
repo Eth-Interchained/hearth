@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p hearth-core -p hearth-resolve --all-targets
+      - run: cargo test --workspace --all-targets
 
   crates:
     needs: guard
@@ -43,6 +43,10 @@ jobs:
         run: |
           cargo publish -p hearth-core --allow-dirty || echo "hearth-core already published"
           cargo publish -p hearth-resolve --allow-dirty || echo "hearth-resolve already published"
+          # store depends on core; serve depends on both. Publish in
+          # dependency order, waiting for the index to catch up.
+          cargo publish -p hearth-store --allow-dirty || echo "hearth-store already published"
+          cargo publish -p hearth-serve --allow-dirty || echo "hearth-serve already published"
 
   # ---------------------------------------------------------------- python --
   wheels:

@@ -24,7 +24,7 @@ jobs:
       # every rule about residency and VRAM is verifiable on a machine that
       # has never seen a model.
       - name: test the pure crates
-        run: cargo test -p hearth-core -p hearth-resolve --all-targets
+        run: cargo test --workspace --all-targets
 
       # The bindings only have to COMPILE here. They contain no rules — if a
       # binding needed its own tests, it would mean logic had leaked into it.
