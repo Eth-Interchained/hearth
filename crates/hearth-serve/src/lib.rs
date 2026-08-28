@@ -19,6 +19,7 @@
 
 pub mod probe;
 pub mod server;
+pub mod warmup;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
