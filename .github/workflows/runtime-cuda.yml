@@ -30,13 +30,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: install CUDA toolkit (no GPU needed to compile)
-        uses: Jimver/cuda-toolkit@v0.2.19
-        with:
-          cuda: "12.4.1"
-          method: network
-          # Just the compiler and libraries — the full local installer is 4GB+
-          # of things a build never touches.
-          sub-packages: '["nvcc", "cudart-dev", "cublas-dev", "toolkit"]'
+        # NVIDIA's own documented network install, not a third-party action —
+        # the first attempt used one and died inside it with a bare
+        # "sudo failed with exit code 100", which is not an error message
+        # anyone can act on. This sequence is controllable end to end.
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cuda-toolkit-12-4
+          echo "/usr/local/cuda-12.4/bin" >> "$GITHUB_PATH"
+          /usr/local/cuda-12.4/bin/nvcc --version
 
       - name: fetch the latest llama.cpp release source
         id: llama
