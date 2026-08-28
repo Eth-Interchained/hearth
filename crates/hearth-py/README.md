@@ -117,7 +117,7 @@ fleet.observe("muse-local:latest", "probe_failed", {
 
 Omit it and it reads as `True` — "the card was still there" — so a missing field can never quietly exonerate an operator. Absence has to be positively observed.
 
-> **Spell it `gpu_present`, in snake_case.** As of 0.3.1 this parser accepts only that spelling, and an unrecognised key falls back to "the GPU was present" — so a dict written as `{"gpuPresent": False}` reports `evicted` with `operator_fault: True`, the exact opposite of what you meant, with no error. `probe_ok` takes `vram_bytes` the same way. Accepting both spellings here (as the roster parser already does) is a tracked fix.
+> **Either spelling works** — `gpu_present` or `gpuPresent`, and `vram_bytes` or `vramBytes` on `probe_ok`. Up to and including 0.3.2 this parser read only the snake_case spelling and an unrecognised key fell back to "the GPU was present", so `{"gpuPresent": False}` reported `evicted` with `operator_fault: True` — the opposite of what the caller meant, silently. The mapping now lives in `hearth-core` and is tested once, so the two bindings cannot drift apart again.
 
 You pass **facts**, never conclusions. What state those produce is the core's job, decided by one state machine tested once in Rust rather than three times in three languages.
 

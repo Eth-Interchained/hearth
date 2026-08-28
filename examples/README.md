@@ -62,7 +62,9 @@ Key names differ **by language on purpose**, and you cannot copy them between th
 | Node | camelCase — `shortBytes`, `committedBytes` | `weightsBytes` *or* `weights_bytes`; `gpuPresent` |
 | Python | snake_case — `short_bytes`, `committed_bytes` | `weights_bytes` *or* `weightsBytes`; `gpu_present` |
 
-The roster parser accepts both spellings in both languages. The `observe(...)` detail dict, as of 0.3.1, does **not** — and an unrecognised key there falls back to "the GPU was present," which reports `evicted` when you meant `gpu_detached`. Spell it the way your language does. Making that parser accept both is a tracked fix.
+Both parsers accept both spellings in both languages — the roster always did, and `observe(...)` does as of 0.3.3. Before that, an unrecognised key in the detail dict fell back to "the GPU was present," which reported `evicted` when you meant `gpu_detached`, silently. The mapping now lives in `hearth-core` and is tested once, so the bindings cannot drift apart again.
+
+What still differs is only what comes back **out**: Node returns camelCase, Python returns snake_case. Write keys the way your language does and read them the same way.
 
 ---
 
