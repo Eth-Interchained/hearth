@@ -17,7 +17,7 @@
 
 use hearth_core::budget::{declared_from_json, plan as core_plan, Budget, Declared};
 use hearth_core::fleet::Fleet;
-use hearth_core::residency::{Millis, Observation};
+use hearth_core::residency::{observation_from_json, Millis};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde_json::{json, Value};
@@ -83,48 +83,29 @@ impl PyFleet {
     /// kind: load_started · probe_ok · probe_failed · process_exited ·
     ///       load_failed · stop
     #[pyo3(signature = (model, kind, detail_json, now))]
+    /// Record something observed. `kind` is one of:
+    /// load_started · probe_ok · probe_failed · process_exited · load_failed · stop
+    ///
+    /// Either key spelling is accepted (`gpu_present` or `gpuPresent`,
+    /// `vram_bytes` or `vramBytes`) because the mapping lives in the core now,
+    /// once. It used to live here AND in the Node binding with different
+    /// spellings, so a dict written the other language's way silently lost its
+    /// most important field.
+    ///
+    /// Raises on an unrecognised `kind`; it used to return silently, which made
+    /// a typo indistinguishable from a model that never changed state.
     fn observe(&mut self, model: &str, kind: &str, detail_json: &str, now: u64) -> PyResult<()> {
         let d = parse(detail_json)?;
-        let obs = match kind {
-            "load_started" => Observation::LoadStarted,
-            "probe_ok" => Observation::ProbeOk {
-                vram_bytes: d.get("vram_bytes").and_then(|v| v.as_u64()).unwrap_or(0),
-            },
-            "probe_failed" => Observation::ProbeFailed {
-                // Missing means "could not tell", and the safe reading of that
-                // is the GPU is still present — a missing field must never
-                // silently exonerate an operator.
-                gpu_present: d
-                    .get("gpu_present")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true),
-                detail: d
-                    .get("detail")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            },
-            "process_exited" => Observation::ProcessExited {
-                code: d.get("code").and_then(|v| v.as_i64()).map(|c| c as i32),
-            },
-            "load_failed" => Observation::LoadFailed {
-                detail: d
-                    .get("detail")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
-            },
-            "stop" => Observation::StopRequested,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "unknown observation: {other}"
-                )))
-            }
-        };
-        self.inner.observe(model, &obs, now as Millis);
+        let obs = observation_from_json(kind, &d).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "unknown observation kind {kind:?} — expected one of: \
+                 load_started, probe_ok, probe_failed, process_exited, \
+                 load_failed, stop"
+            ))
+        })?;
+        self.inner.observe(model, &obs, now);
         Ok(())
     }
-
     fn route(&self, model: &str, now: u64) -> PyResult<String> {
         let r = self.inner.route(model, now as Millis);
         let mut v = serde_json::to_value(&r)

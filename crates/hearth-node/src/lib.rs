@@ -12,7 +12,7 @@
 
 use hearth_core::budget::{declared_from_json, plan as core_plan, Budget};
 use hearth_core::fleet::Fleet;
-use hearth_core::residency::{Millis, Observation};
+use hearth_core::residency::{observation_from_json, Millis};
 use napi_derive::napi;
 use serde_json::{json, Value};
 
@@ -88,49 +88,29 @@ impl HearthFleet {
     ///
     /// `gpuPresent` on a probe_failed is the single most important field that
     /// crosses this boundary: it is what separates the runtime dropping a model
-    /// from the host taking the card away.
+    /// from the host taking the card away. Either spelling is accepted —
+    /// `gpuPresent` or `gpu_present` — because the mapping now lives in the
+    /// core, once, instead of once per binding with different key names.
+    ///
+    /// Throws on an unrecognised `kind`. It used to return silently, which
+    /// meant a typo looked exactly like a model that never changed state.
     #[napi]
-    pub fn observe(&mut self, model: String, kind: String, detail: Value, now: i64) {
-        let now = now.max(0) as Millis;
-        let obs = match kind.as_str() {
-            "load_started" => Observation::LoadStarted,
-            "probe_ok" => Observation::ProbeOk {
-                vram_bytes: detail
-                    .get("vramBytes")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-            },
-            "probe_failed" => Observation::ProbeFailed {
-                // Absent means "we could not tell", and the safe reading of
-                // "could not tell" is that the GPU is still there — that keeps
-                // a missing field from silently exonerating an operator.
-                gpu_present: detail
-                    .get("gpuPresent")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true),
-                detail: detail
-                    .get("detail")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            },
-            "process_exited" => Observation::ProcessExited {
-                code: detail
-                    .get("code")
-                    .and_then(|v| v.as_i64())
-                    .map(|c| c as i32),
-            },
-            "load_failed" => Observation::LoadFailed {
-                detail: detail
-                    .get("detail")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
-            },
-            "stop" => Observation::StopRequested,
-            _ => return,
-        };
-        self.inner.observe(&model, &obs, now);
+    pub fn observe(
+        &mut self,
+        model: String,
+        kind: String,
+        detail: Value,
+        now: i64,
+    ) -> napi::Result<()> {
+        let obs = observation_from_json(&kind, &detail).ok_or_else(|| {
+            napi::Error::from_reason(format!(
+                "unknown observation kind {kind:?} — expected one of: \
+                 load_started, probe_ok, probe_failed, process_exited, \
+                 load_failed, stop"
+            ))
+        })?;
+        self.inner.observe(&model, &obs, now.max(0) as Millis);
+        Ok(())
     }
 
     /// What should a router do with a request for this model?

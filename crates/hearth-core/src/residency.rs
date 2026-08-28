@@ -114,6 +114,70 @@ pub enum Observation {
     StopRequested,
 }
 
+/// Read an `Observation` out of a `kind` plus a JSON detail object.
+///
+/// Lives here, in the core, because both bindings previously carried their own
+/// copy of this mapping — and the copies disagreed. Node read `gpuPresent`,
+/// Python read `gpu_present`, and each treated the *other* language's spelling
+/// as an absent field. Since an absent `gpu_present` deliberately reads as
+/// `true` (an unreadable fact must never exonerate an operator), a Python
+/// caller who wrote `{"gpuPresent": false}` got `Evicted` with
+/// `is_operator_fault() == true` — the opposite of what they meant, and no
+/// error. One character of casing decided who took the blame for a card their
+/// host reclaimed.
+///
+/// So: both spellings, from one function tested once. `budget::declared_from_json`
+/// already worked this way for exactly this reason; this brings observations
+/// in line with the roster.
+///
+/// Returns `None` for an unrecognised `kind` so a caller can say so out loud,
+/// rather than silently doing nothing — which is what both bindings did.
+pub fn observation_from_json(kind: &str, detail: &serde_json::Value) -> Option<Observation> {
+    fn field<'a>(
+        d: &'a serde_json::Value,
+        camel: &str,
+        snake: &str,
+    ) -> Option<&'a serde_json::Value> {
+        d.get(camel).or_else(|| d.get(snake))
+    }
+
+    fn detail_str(d: &serde_json::Value, fallback: &str) -> String {
+        d.get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or(fallback)
+            .to_string()
+    }
+
+    Some(match kind {
+        "load_started" | "loadStarted" => Observation::LoadStarted,
+        "probe_ok" | "probeOk" => Observation::ProbeOk {
+            vram_bytes: field(detail, "vramBytes", "vram_bytes")
+                .and_then(crate::budget::whole_bytes)
+                .unwrap_or(0),
+        },
+        "probe_failed" | "probeFailed" => Observation::ProbeFailed {
+            // Absent — or unreadable — means "we could not tell", and the safe
+            // reading of that is that the card was still there. A missing field
+            // must never hand out an alibi.
+            gpu_present: field(detail, "gpuPresent", "gpu_present")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            detail: detail_str(detail, ""),
+        },
+        "process_exited" | "processExited" => Observation::ProcessExited {
+            code: detail
+                .get("code")
+                .and_then(|v| v.as_i64())
+                .map(|c| c as i32),
+        },
+        "load_failed" | "loadFailed" => Observation::LoadFailed {
+            detail: detail_str(detail, "unknown"),
+        },
+        "stop" | "stop_requested" | "stopRequested" => Observation::StopRequested,
+        _ => return None,
+    })
+}
+
 impl Residency {
     /// Is this model able to serve a request right now?
     ///
@@ -243,5 +307,182 @@ impl Residency {
                 reason: detail.clone(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod observation_json_tests {
+    use super::*;
+    use serde_json::json;
+
+    // These are the highest-stakes assertions in the crate. `gpu_present`
+    // decides Evicted vs GpuDetached, and `is_operator_fault` reads it
+    // straight out — so a field lost in translation bills a provider's
+    // decision to the operator.
+
+    #[test]
+    fn both_spellings_of_gpu_present_are_read() {
+        for detail in [json!({"gpu_present": false}), json!({"gpuPresent": false})] {
+            let obs = observation_from_json("probe_failed", &detail).expect("known kind");
+            assert_eq!(
+                obs,
+                Observation::ProbeFailed {
+                    gpu_present: false,
+                    detail: String::new()
+                },
+                "spelling must not change the verdict: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bug_this_function_exists_to_delete() {
+        // Before this lived in the core, the Python binding read only
+        // `gpu_present` and the Node binding read only `gpuPresent`. Each
+        // treated the other's spelling as absent, and absent means "assume the
+        // card was there" — so `{"gpuPresent": false}` in Python produced
+        // Evicted, which IS the operator's fault. The opposite of the truth,
+        // silently.
+        let detail = json!({"gpuPresent": false, "detail": "no CUDA device"});
+        let obs = observation_from_json("probe_failed", &detail).unwrap();
+
+        let state = Residency::Unknown
+            .observe(&Observation::LoadStarted, 0)
+            .observe(&Observation::ProbeOk { vram_bytes: 1 }, 1_000)
+            .observe(&obs, 2_000);
+
+        match state {
+            Residency::Lost { reason, .. } => {
+                assert_eq!(reason, LostReason::GpuDetached);
+                assert!(
+                    !reason.is_operator_fault(),
+                    "the host took the card — this must never count against them"
+                );
+            }
+            other => panic!("expected a loss, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_gpu_present_still_counts_against_us() {
+        // Unchanged and deliberate: unreadable must never exonerate.
+        let obs = observation_from_json("probe_failed", &json!({"detail": "?"})).unwrap();
+        assert_eq!(
+            obs,
+            Observation::ProbeFailed {
+                gpu_present: true,
+                detail: "?".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unreadable_gpu_present_is_treated_as_missing_not_as_absence() {
+        let obs = observation_from_json("probe_failed", &json!({"gpu_present": "nope"})).unwrap();
+        assert_eq!(
+            obs,
+            Observation::ProbeFailed {
+                gpu_present: true,
+                detail: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn a_js_float_vram_is_not_silently_zero() {
+        // JS has no integers: 21 GiB arrives as an f64. A bare `as_u64()`
+        // returns None for it, so the Node binding recorded a resident model
+        // holding ZERO bytes — the budget then believed the card was empty and
+        // would start models that could not fit. Same class of bug as the
+        // 0.1.0 roster loss, in a different field.
+        let gib = 1024u64 * 1024 * 1024;
+        let as_float = json!({"vramBytes": (21 * gib) as f64});
+        assert_eq!(
+            observation_from_json("probe_ok", &as_float).unwrap(),
+            Observation::ProbeOk {
+                vram_bytes: 21 * gib
+            },
+        );
+        // And the snake_case integer form, which always worked.
+        assert_eq!(
+            observation_from_json("probe_ok", &json!({"vram_bytes": 21 * gib})).unwrap(),
+            Observation::ProbeOk {
+                vram_bytes: 21 * gib
+            },
+        );
+    }
+
+    #[test]
+    fn a_fractional_vram_is_refused_rather_than_truncated() {
+        // 1.5 bytes is not a byte count. Truncating it would be inventing data.
+        assert_eq!(
+            observation_from_json("probe_ok", &json!({"vramBytes": 1.5})).unwrap(),
+            Observation::ProbeOk { vram_bytes: 0 },
+        );
+    }
+
+    #[test]
+    fn every_kind_round_trips() {
+        assert_eq!(
+            observation_from_json("load_started", &json!({})),
+            Some(Observation::LoadStarted)
+        );
+        assert_eq!(
+            observation_from_json("process_exited", &json!({"code": 1})),
+            Some(Observation::ProcessExited { code: Some(1) })
+        );
+        assert_eq!(
+            observation_from_json("process_exited", &json!({})),
+            Some(Observation::ProcessExited { code: None })
+        );
+        assert_eq!(
+            observation_from_json("load_failed", &json!({"detail": "no such file"})),
+            Some(Observation::LoadFailed {
+                detail: "no such file".into()
+            })
+        );
+        // A load failure with nothing said is still a load failure, and
+        // "unknown" is a more honest detail than an empty string.
+        assert_eq!(
+            observation_from_json("load_failed", &json!({})),
+            Some(Observation::LoadFailed {
+                detail: "unknown".into()
+            })
+        );
+        assert_eq!(
+            observation_from_json("stop", &json!({})),
+            Some(Observation::StopRequested)
+        );
+    }
+
+    #[test]
+    fn camelcase_kinds_work_too_because_one_language_writes_them_that_way() {
+        assert_eq!(
+            observation_from_json("loadStarted", &json!({})),
+            Some(Observation::LoadStarted)
+        );
+        assert_eq!(
+            observation_from_json("probeOk", &json!({"vramBytes": 8})),
+            Some(Observation::ProbeOk { vram_bytes: 8 })
+        );
+    }
+
+    #[test]
+    fn an_unknown_kind_is_none_so_a_caller_can_say_so_out_loud() {
+        // Both bindings used to `return` silently here, which made a typo
+        // indistinguishable from a model that never changed state.
+        assert_eq!(observation_from_json("probe_okay", &json!({})), None);
+        assert_eq!(observation_from_json("", &json!({})), None);
+    }
+
+    #[test]
+    fn a_non_object_detail_does_not_panic() {
+        assert_eq!(
+            observation_from_json("probe_failed", &json!(null)).unwrap(),
+            Observation::ProbeFailed {
+                gpu_present: true,
+                detail: String::new()
+            }
+        );
     }
 }
