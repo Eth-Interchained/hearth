@@ -240,6 +240,15 @@ impl Spine {
         }
     }
 
+    /// Latest residency event for every model the spine has ever seen.
+    pub fn all_latest(&self) -> Vec<Event> {
+        self.db
+            .list(RESIDENCY)
+            .iter()
+            .filter_map(Event::of)
+            .collect()
+    }
+
     /// Current global sequence — the clock `state_as_of` reads against.
     pub fn seq(&self) -> u64 {
         self.db.seq.load(std::sync::atomic::Ordering::SeqCst)
@@ -321,7 +330,7 @@ mod tests {
                 &Transition::PullStarted {
                     source: "ollama:library/muse:latest".into(),
                 },
-                &[declared.clone()],
+                std::slice::from_ref(&declared),
             )
             .unwrap();
         let pulled = s
@@ -399,7 +408,7 @@ mod tests {
             &Transition::Lost {
                 reason: LostReason::GpuDetached,
             },
-            &[resident.clone()],
+            std::slice::from_ref(&resident),
         )
         .unwrap();
 
