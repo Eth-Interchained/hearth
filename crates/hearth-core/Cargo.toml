@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["llm", "gpu", "vram", "residency", "inference"]
+categories = ["caching", "data-structures", "science"]
+documentation = "https://docs.rs/hearth-core"
+homepage.workspace = true
 authors.workspace = true
 
 [dependencies]

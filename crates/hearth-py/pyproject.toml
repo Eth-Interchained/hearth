@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "hearth-engine"
 version = "0.3.1"
 description = "Deterministic model residency — keep declared models warm, and tell the truth about which ones are."
-readme = "../../README.md"
+readme = "README.md"
 license = { text = "BUSL-1.1" }
 requires-python = ">=3.9"
 authors = [{ name = "Interchained LLC" }]
@@ -19,8 +19,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Eth-Interchained/hearth"
-Repository = "https://github.com/Eth-Interchained/hearth"
+Homepage = "https://github.com/aiassistsecure/hearth"
+Repository = "https://github.com/aiassistsecure/hearth"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
