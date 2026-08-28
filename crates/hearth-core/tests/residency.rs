@@ -1,0 +1,304 @@
+//! The scenarios these tests encode all happened, on 2026-08-27, on one
+//! RTX A6000 rented from a GPU-virtualization host, serving a PIN operator.
+//!
+//! Symptom: requests hung, then failed. Four pull requests were merged that
+//! night against the streaming path, and none of them were the cause, because
+//! the cause was never visible — every distinct failure arrived as the same
+//! timeout.
+
+use hearth_core::budget::{gib, GIB};
+use hearth_core::{plan, Budget, Declared, LostReason, Observation, Residency};
+
+const T0: u64 = 1_000_000;
+const SEC: u64 = 1_000;
+
+fn resident(vram: u64) -> Residency {
+    Residency::Unknown
+        .observe(&Observation::LoadStarted, T0)
+        .observe(&Observation::ProbeOk { vram_bytes: vram }, T0 + 30 * SEC)
+}
+
+// ---------------------------------------------------------------------------
+// The two states that do not exist anywhere else.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_detached_gpu_is_not_the_operators_fault() {
+    // The host reclaimed the card while the process kept running. This is the
+    // whole reason the crate exists: the operator did nothing wrong, and
+    // scoring them down for it poisons the only signal the network has.
+    let lost = resident(20 * GIB).observe(
+        &Observation::ProbeFailed {
+            gpu_present: false,
+            detail: "no CUDA device".into(),
+        },
+        T0 + 300 * SEC,
+    );
+
+    match &lost {
+        Residency::Lost { reason, .. } => {
+            assert_eq!(*reason, LostReason::GpuDetached);
+            assert!(!reason.is_operator_fault(), "must never count against them");
+            assert!(reason.worth_retrying_here(), "the card may come right back");
+        }
+        other => panic!("expected Lost, got {other:?}"),
+    }
+    assert!(lost.explain(T0 + 300 * SEC).contains("detached by the host"));
+}
+
+#[test]
+fn an_eviction_is_the_operators_problem_and_says_so() {
+    // GPU still present, model gone: the runtime dropped it to free VRAM.
+    // That IS the operator's to fix — they declared more than the card holds.
+    let lost = resident(20 * GIB).observe(
+        &Observation::ProbeFailed {
+            gpu_present: true,
+            detail: "model not loaded".into(),
+        },
+        T0 + 300 * SEC,
+    );
+
+    match &lost {
+        Residency::Lost { reason, .. } => {
+            assert_eq!(*reason, LostReason::Evicted);
+            assert!(reason.is_operator_fault());
+            // Re-asking the same over-committed box just evicts something else.
+            assert!(!reason.worth_retrying_here());
+        }
+        other => panic!("expected Lost, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_two_losses_are_distinguishable_from_identical_symptoms() {
+    // Same prior state, same failed probe, one bit of difference — and that
+    // bit is the entire diagnosis. Without it both are "timeout".
+    let detached = resident(20 * GIB).observe(
+        &Observation::ProbeFailed { gpu_present: false, detail: "x".into() },
+        T0 + SEC,
+    );
+    let evicted = resident(20 * GIB).observe(
+        &Observation::ProbeFailed { gpu_present: true, detail: "x".into() },
+        T0 + SEC,
+    );
+    assert_ne!(detached, evicted);
+    assert_ne!(
+        detached.explain(T0 + SEC),
+        evicted.explain(T0 + SEC),
+        "an operator must be able to tell these apart by reading one line",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Loading. The state everything else lies about.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn loading_is_not_ready_and_routing_must_not_pretend_otherwise() {
+    // The most common way a serving stack lies: route to something still
+    // coming up, then call the inevitable timeout an error.
+    let loading = Residency::Unknown.observe(&Observation::LoadStarted, T0);
+    assert!(!loading.is_ready());
+    assert!(loading.is_coming(), "a caller can wait instead of failing over");
+}
+
+#[test]
+fn a_slow_load_is_never_a_failure_however_long_it_takes() {
+    // A 32B materializing over a network fabric can legitimately take minutes.
+    // Killing it on a deadline converts a slow success into a fast failure.
+    let loading = Residency::Unknown.observe(&Observation::LoadStarted, T0);
+    let after_ten_minutes = T0 + 600 * SEC;
+    assert!(loading.is_coming());
+    assert_eq!(loading.loading_for(after_ten_minutes), Some(600 * SEC));
+    assert!(loading.explain(after_ten_minutes).contains("600s"));
+}
+
+#[test]
+fn a_failed_probe_while_still_loading_is_expected_not_a_loss() {
+    // The server simply is not up yet. Demoting here would make every cold
+    // start look like a fault.
+    let loading = Residency::Unknown.observe(&Observation::LoadStarted, T0);
+    let still = loading.observe(
+        &Observation::ProbeFailed { gpu_present: true, detail: "conn refused".into() },
+        T0 + 5 * SEC,
+    );
+    assert_eq!(still, loading, "still loading, nothing has gone wrong");
+}
+
+#[test]
+fn but_a_vanishing_gpu_is_news_even_mid_load() {
+    let loading = Residency::Unknown.observe(&Observation::LoadStarted, T0);
+    let lost = loading.observe(
+        &Observation::ProbeFailed { gpu_present: false, detail: "no device".into() },
+        T0 + 5 * SEC,
+    );
+    assert!(matches!(
+        lost,
+        Residency::Lost { reason: LostReason::GpuDetached, .. }
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Bookkeeping that has to survive contact with reality.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resident_since_survives_thousands_of_probes() {
+    // "Resident for four hours" must stay true no matter how often we check.
+    let mut r = resident(20 * GIB);
+    let start = match r {
+        Residency::Resident { since, .. } => since,
+        _ => unreachable!(),
+    };
+    for i in 1..2000u64 {
+        r = r.observe(&Observation::ProbeOk { vram_bytes: 20 * GIB }, T0 + i * SEC);
+    }
+    assert!(matches!(r, Residency::Resident { since, .. } if since == start));
+}
+
+#[test]
+fn a_deliberate_stop_is_nobodys_fault_and_its_exit_is_not_either() {
+    // Without this, every clean shutdown files a fault against the operator.
+    let stopped = resident(20 * GIB).observe(&Observation::StopRequested, T0 + SEC);
+    assert!(matches!(stopped, Residency::Stopped { .. }));
+
+    let after_exit = stopped.observe(&Observation::ProcessExited { code: Some(0) }, T0 + 2 * SEC);
+    assert!(
+        matches!(after_exit, Residency::Stopped { .. }),
+        "the exit is the epilogue of the stop, not a new loss",
+    );
+}
+
+#[test]
+fn a_spurious_load_start_does_not_knock_a_healthy_model_offline() {
+    let r = resident(20 * GIB);
+    let again = r.observe(&Observation::LoadStarted, T0 + 60 * SEC);
+    assert_eq!(again, r, "a healthy model must not be reported unavailable");
+}
+
+#[test]
+fn only_resident_models_count_against_the_vram_budget() {
+    // A loading model has not claimed its memory yet. Counting it would make
+    // the planner refuse admissions it should allow.
+    let loading = Residency::Unknown.observe(&Observation::LoadStarted, T0);
+    assert_eq!(loading.vram_bytes(), 0);
+    assert_eq!(resident(20 * GIB).vram_bytes(), 20 * GIB);
+}
+
+#[test]
+fn every_state_accepts_every_observation_without_panicking() {
+    // The real world delivers these in orders nobody planned for. A supervisor
+    // that panics on a surprising sequence is worse than one that records
+    // something slightly odd.
+    let states = [
+        Residency::Unknown,
+        Residency::Loading { since: T0 },
+        Residency::Resident { since: T0, vram_bytes: GIB },
+        Residency::Lost { at: T0, reason: LostReason::Evicted },
+        Residency::Failed { at: T0, reason: "oom".into() },
+        Residency::Stopped { at: T0 },
+    ];
+    let obs = [
+        Observation::LoadStarted,
+        Observation::ProbeOk { vram_bytes: GIB },
+        Observation::ProbeFailed { gpu_present: true, detail: "x".into() },
+        Observation::ProbeFailed { gpu_present: false, detail: "x".into() },
+        Observation::ProcessExited { code: Some(1) },
+        Observation::LoadFailed { detail: "no such model".into() },
+        Observation::StopRequested,
+    ];
+    for s in &states {
+        for o in &obs {
+            let next = s.observe(o, T0 + SEC);
+            // And it always has something honest to say about itself.
+            assert!(!next.explain(T0 + SEC).is_empty());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The budget. This is the check that would have caught it on day one.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn one_a6000_cannot_hold_the_roster_that_was_declared_on_it() {
+    // 48 GiB card. These are the models that were registered when PIN stopped
+    // working, with rough Q4 weights plus a modest KV allowance. Nothing
+    // errored at the time — the runtime simply loaded and evicted in a loop
+    // forever, and it presented as "the models got slow".
+    let card = Budget::with_reserve_pct(48 * GIB, 8);
+    let declared = vec![
+        Declared { model: "muse-local:latest".into(),  weights_bytes: 20 * GIB, kv_bytes: GIB },
+        Declared { model: "deepseek-r1:32b".into(),    weights_bytes: 20 * GIB, kv_bytes: GIB },
+        Declared { model: "gemma4:26b".into(),         weights_bytes: 16 * GIB, kv_bytes: GIB },
+        Declared { model: "qwen3.6:27b".into(),        weights_bytes: 17 * GIB, kv_bytes: GIB },
+    ];
+
+    let p = plan(card, &declared);
+
+    assert!(!p.fits(), "this roster has never fit on this card");
+    assert_eq!(p.admitted, vec!["muse-local:latest", "deepseek-r1:32b"]);
+    assert_eq!(p.rejected.len(), 2);
+
+    // The rejection has to carry the number, because "you are short by N GiB"
+    // is actionable and "invalid configuration" is not.
+    let first = &p.rejected[0];
+    assert_eq!(first.model, "gemma4:26b");
+    assert!(first.short_bytes() > 0);
+    assert!(p.explain().contains("REJECTED gemma4:26b"));
+    assert!(p.explain().contains("short by"));
+}
+
+#[test]
+fn declaration_order_is_priority_order() {
+    // First fit, never best fit. Reordering to squeeze in one more model would
+    // silently demote the model the operator listed first — and on a serving
+    // box, first means most important.
+    let card = Budget::with_reserve_pct(48 * GIB, 8);
+    let big_first = vec![
+        Declared { model: "big".into(),   weights_bytes: 40 * GIB, kv_bytes: 0 },
+        Declared { model: "small".into(), weights_bytes: 2 * GIB,  kv_bytes: 0 },
+        Declared { model: "tiny".into(),  weights_bytes: GIB,      kv_bytes: 0 },
+    ];
+    let p = plan(card, &big_first);
+    assert_eq!(p.admitted[0], "big", "the operator asked for big first");
+}
+
+#[test]
+fn the_reserve_is_never_planned_into() {
+    let card = Budget::with_reserve_pct(48 * GIB, 8);
+    assert!(card.usable_bytes() < card.total_bytes);
+    let all = vec![Declared {
+        model: "greedy".into(),
+        weights_bytes: 48 * GIB,
+        kv_bytes: 0,
+    }];
+    let p = plan(card, &all);
+    assert!(
+        !p.fits(),
+        "a model sized to the whole card must not be admitted — KV cache, \
+         CUDA context and fragmentation all still have to fit somewhere",
+    );
+}
+
+#[test]
+fn a_roster_that_fits_reports_its_headroom() {
+    let card = Budget::with_reserve_pct(48 * GIB, 8);
+    let declared = vec![
+        Declared { model: "muse-local:latest".into(), weights_bytes: 20 * GIB, kv_bytes: GIB },
+        Declared { model: "deepseek-r1:32b".into(),   weights_bytes: 20 * GIB, kv_bytes: GIB },
+    ];
+    let p = plan(card, &declared);
+    assert!(p.fits());
+    assert_eq!(p.rejected.len(), 0);
+    assert!(gib(p.headroom_bytes()) >= 0.0);
+    assert!(p.explain().contains("2 of 2 admitted"));
+}
+
+#[test]
+fn a_tiny_card_still_gets_a_real_reserve() {
+    // 8% of a small card is not enough for a CUDA context, so the reserve has
+    // a floor. Otherwise the planner cheerfully fills a 4 GiB card to 3.7.
+    let small = Budget::with_reserve_pct(4 * GIB, 8);
+    assert!(small.reserve_bytes >= GIB);
+}
