@@ -599,10 +599,10 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
     // order that matters to them; first fit, never best fit.
     let declared: Vec<Declared> = specs
         .iter()
-        .map(|(name, _, gib)| Declared {
+        .map(|(name, gguf_path, gib)| Declared {
             model: name.clone(),
             weights_bytes: gib * GIB,
-            kv_bytes: 0,
+            kv_bytes: kv_bytes_for_model(gguf_path, ctx, parallel),
         })
         .collect();
 
@@ -917,6 +917,53 @@ fn collect_models(args: &[String]) -> Result<Vec<(String, String, u64)>, String>
     Ok(out)
 }
 
+/// The KV cache a model at `ctx_flag`/`parallel` will actually allocate,
+/// read from its own GGUF header.
+///
+/// THIS IS THE NUMBER THE PLANNER WAS MISSING. `Declared.kv_bytes` has
+/// existed since `budget::plan` was written, and every caller here passed
+/// `0` — so two models could each fit the card on weight size alone while
+/// the KV cache neither one budgeted for exhausted it anyway. On
+/// 2026-08-28 that put a production A6000 through exactly this:
+/// `muse-local:latest` at `--parallel 8` and no explicit `--ctx` spent
+/// ~14 GiB on KV cache nothing had declared, `qwen2.5:14b`'s own CUDA
+/// allocation failed against what was left, and `llama-server` exited with
+/// no error text. `/residency` reported "30.0 / 42.0 GiB held" throughout —
+/// correct about weights, silent about the number that mattered.
+///
+/// Failure to read the header is NOT fatal — the model still fails an
+/// unreadable-header case exactly as it did before this existed (declared
+/// at weight size alone) rather than refusing to start over a header this
+/// reader could not parse. It is loud on stderr, though: a silent 0 here is
+/// the same silent gap this function exists to close.
+fn kv_bytes_for_model(gguf_path: &str, ctx_flag: u32, parallel: u32) -> u64 {
+    let file = match std::fs::File::open(gguf_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "hearth: could not open {gguf_path} to size its KV cache ({e}) — \
+                 budgeting weights only for this model, same as before KV accounting existed"
+            );
+            return 0;
+        }
+    };
+    let mut reader = std::io::BufReader::new(file);
+    match hearth_core::read_kv_shape(&mut reader) {
+        Ok(shape) => {
+            let total_ctx =
+                hearth_core::total_ctx_tokens(ctx_flag, shape.context_length, parallel);
+            shape.kv_bytes_for(total_ctx)
+        }
+        Err(e) => {
+            eprintln!(
+                "hearth: could not read KV shape from {gguf_path} ({e}) — \
+                 budgeting weights only for this model, same as before KV accounting existed"
+            );
+            0
+        }
+    }
+}
+
 fn cmd_serve(args: &[String]) -> Result<(), String> {
     let model = flag(args, "--model").ok_or("--model is required")?;
     let gguf = flag(args, "--gguf").ok_or("--gguf is required")?;
@@ -961,7 +1008,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     let declared = vec![Declared {
         model: model.clone(),
         weights_bytes: vram_gib * GIB,
-        kv_bytes: 0,
+        kv_bytes: kv_bytes_for_model(&gguf, ctx, spec.parallel),
     }];
 
     install_signal_handlers();
