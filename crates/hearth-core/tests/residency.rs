@@ -43,7 +43,9 @@ fn a_detached_gpu_is_not_the_operators_fault() {
         }
         other => panic!("expected Lost, got {other:?}"),
     }
-    assert!(lost.explain(T0 + 300 * SEC).contains("detached by the host"));
+    assert!(lost
+        .explain(T0 + 300 * SEC)
+        .contains("detached by the host"));
 }
 
 #[test]
@@ -74,11 +76,17 @@ fn the_two_losses_are_distinguishable_from_identical_symptoms() {
     // Same prior state, same failed probe, one bit of difference — and that
     // bit is the entire diagnosis. Without it both are "timeout".
     let detached = resident(20 * GIB).observe(
-        &Observation::ProbeFailed { gpu_present: false, detail: "x".into() },
+        &Observation::ProbeFailed {
+            gpu_present: false,
+            detail: "x".into(),
+        },
         T0 + SEC,
     );
     let evicted = resident(20 * GIB).observe(
-        &Observation::ProbeFailed { gpu_present: true, detail: "x".into() },
+        &Observation::ProbeFailed {
+            gpu_present: true,
+            detail: "x".into(),
+        },
         T0 + SEC,
     );
     assert_ne!(detached, evicted);
@@ -99,7 +107,10 @@ fn loading_is_not_ready_and_routing_must_not_pretend_otherwise() {
     // coming up, then call the inevitable timeout an error.
     let loading = Residency::Unknown.observe(&Observation::LoadStarted, T0);
     assert!(!loading.is_ready());
-    assert!(loading.is_coming(), "a caller can wait instead of failing over");
+    assert!(
+        loading.is_coming(),
+        "a caller can wait instead of failing over"
+    );
 }
 
 #[test]
@@ -119,7 +130,10 @@ fn a_failed_probe_while_still_loading_is_expected_not_a_loss() {
     // start look like a fault.
     let loading = Residency::Unknown.observe(&Observation::LoadStarted, T0);
     let still = loading.observe(
-        &Observation::ProbeFailed { gpu_present: true, detail: "conn refused".into() },
+        &Observation::ProbeFailed {
+            gpu_present: true,
+            detail: "conn refused".into(),
+        },
         T0 + 5 * SEC,
     );
     assert_eq!(still, loading, "still loading, nothing has gone wrong");
@@ -129,12 +143,18 @@ fn a_failed_probe_while_still_loading_is_expected_not_a_loss() {
 fn but_a_vanishing_gpu_is_news_even_mid_load() {
     let loading = Residency::Unknown.observe(&Observation::LoadStarted, T0);
     let lost = loading.observe(
-        &Observation::ProbeFailed { gpu_present: false, detail: "no device".into() },
+        &Observation::ProbeFailed {
+            gpu_present: false,
+            detail: "no device".into(),
+        },
         T0 + 5 * SEC,
     );
     assert!(matches!(
         lost,
-        Residency::Lost { reason: LostReason::GpuDetached, .. }
+        Residency::Lost {
+            reason: LostReason::GpuDetached,
+            ..
+        }
     ));
 }
 
@@ -151,7 +171,12 @@ fn resident_since_survives_thousands_of_probes() {
         _ => unreachable!(),
     };
     for i in 1..2000u64 {
-        r = r.observe(&Observation::ProbeOk { vram_bytes: 20 * GIB }, T0 + i * SEC);
+        r = r.observe(
+            &Observation::ProbeOk {
+                vram_bytes: 20 * GIB,
+            },
+            T0 + i * SEC,
+        );
     }
     assert!(matches!(r, Residency::Resident { since, .. } if since == start));
 }
@@ -193,18 +218,35 @@ fn every_state_accepts_every_observation_without_panicking() {
     let states = [
         Residency::Unknown,
         Residency::Loading { since: T0 },
-        Residency::Resident { since: T0, vram_bytes: GIB },
-        Residency::Lost { at: T0, reason: LostReason::Evicted },
-        Residency::Failed { at: T0, reason: "oom".into() },
+        Residency::Resident {
+            since: T0,
+            vram_bytes: GIB,
+        },
+        Residency::Lost {
+            at: T0,
+            reason: LostReason::Evicted,
+        },
+        Residency::Failed {
+            at: T0,
+            reason: "oom".into(),
+        },
         Residency::Stopped { at: T0 },
     ];
     let obs = [
         Observation::LoadStarted,
         Observation::ProbeOk { vram_bytes: GIB },
-        Observation::ProbeFailed { gpu_present: true, detail: "x".into() },
-        Observation::ProbeFailed { gpu_present: false, detail: "x".into() },
+        Observation::ProbeFailed {
+            gpu_present: true,
+            detail: "x".into(),
+        },
+        Observation::ProbeFailed {
+            gpu_present: false,
+            detail: "x".into(),
+        },
         Observation::ProcessExited { code: Some(1) },
-        Observation::LoadFailed { detail: "no such model".into() },
+        Observation::LoadFailed {
+            detail: "no such model".into(),
+        },
         Observation::StopRequested,
     ];
     for s in &states {
@@ -228,10 +270,26 @@ fn one_a6000_cannot_hold_the_roster_that_was_declared_on_it() {
     // forever, and it presented as "the models got slow".
     let card = Budget::with_reserve_pct(48 * GIB, 8);
     let declared = vec![
-        Declared { model: "muse-local:latest".into(),  weights_bytes: 20 * GIB, kv_bytes: GIB },
-        Declared { model: "deepseek-r1:32b".into(),    weights_bytes: 20 * GIB, kv_bytes: GIB },
-        Declared { model: "gemma4:26b".into(),         weights_bytes: 16 * GIB, kv_bytes: GIB },
-        Declared { model: "qwen3.6:27b".into(),        weights_bytes: 17 * GIB, kv_bytes: GIB },
+        Declared {
+            model: "muse-local:latest".into(),
+            weights_bytes: 20 * GIB,
+            kv_bytes: GIB,
+        },
+        Declared {
+            model: "deepseek-r1:32b".into(),
+            weights_bytes: 20 * GIB,
+            kv_bytes: GIB,
+        },
+        Declared {
+            model: "gemma4:26b".into(),
+            weights_bytes: 16 * GIB,
+            kv_bytes: GIB,
+        },
+        Declared {
+            model: "qwen3.6:27b".into(),
+            weights_bytes: 17 * GIB,
+            kv_bytes: GIB,
+        },
     ];
 
     let p = plan(card, &declared);
@@ -256,9 +314,21 @@ fn declaration_order_is_priority_order() {
     // box, first means most important.
     let card = Budget::with_reserve_pct(48 * GIB, 8);
     let big_first = vec![
-        Declared { model: "big".into(),   weights_bytes: 40 * GIB, kv_bytes: 0 },
-        Declared { model: "small".into(), weights_bytes: 2 * GIB,  kv_bytes: 0 },
-        Declared { model: "tiny".into(),  weights_bytes: GIB,      kv_bytes: 0 },
+        Declared {
+            model: "big".into(),
+            weights_bytes: 40 * GIB,
+            kv_bytes: 0,
+        },
+        Declared {
+            model: "small".into(),
+            weights_bytes: 2 * GIB,
+            kv_bytes: 0,
+        },
+        Declared {
+            model: "tiny".into(),
+            weights_bytes: GIB,
+            kv_bytes: 0,
+        },
     ];
     let p = plan(card, &big_first);
     assert_eq!(p.admitted[0], "big", "the operator asked for big first");
@@ -285,8 +355,16 @@ fn the_reserve_is_never_planned_into() {
 fn a_roster_that_fits_reports_its_headroom() {
     let card = Budget::with_reserve_pct(48 * GIB, 8);
     let declared = vec![
-        Declared { model: "muse-local:latest".into(), weights_bytes: 20 * GIB, kv_bytes: GIB },
-        Declared { model: "deepseek-r1:32b".into(),   weights_bytes: 20 * GIB, kv_bytes: GIB },
+        Declared {
+            model: "muse-local:latest".into(),
+            weights_bytes: 20 * GIB,
+            kv_bytes: GIB,
+        },
+        Declared {
+            model: "deepseek-r1:32b".into(),
+            weights_bytes: 20 * GIB,
+            kv_bytes: GIB,
+        },
     ];
     let p = plan(card, &declared);
     assert!(p.fits());

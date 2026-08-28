@@ -1,0 +1,17 @@
+[package]
+name = "hearth-py"
+description = "Python bindings for hearth — deterministic model residency."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "_hearth"
+crate-type = ["cdylib"]
+
+[dependencies]
+hearth-core = { path = "../hearth-core", version = "0.1.0" }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+serde_json = { workspace = true }

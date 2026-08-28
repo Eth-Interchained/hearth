@@ -19,15 +19,33 @@ fn card() -> Budget {
 
 fn roster() -> Vec<Declared> {
     vec![
-        Declared { model: "muse-local:latest".into(), weights_bytes: 20 * GIB, kv_bytes: GIB },
-        Declared { model: "deepseek-r1:32b".into(),   weights_bytes: 20 * GIB, kv_bytes: GIB },
-        Declared { model: "gemma4:26b".into(),        weights_bytes: 16 * GIB, kv_bytes: GIB },
+        Declared {
+            model: "muse-local:latest".into(),
+            weights_bytes: 20 * GIB,
+            kv_bytes: GIB,
+        },
+        Declared {
+            model: "deepseek-r1:32b".into(),
+            weights_bytes: 20 * GIB,
+            kv_bytes: GIB,
+        },
+        Declared {
+            model: "gemma4:26b".into(),
+            weights_bytes: 16 * GIB,
+            kv_bytes: GIB,
+        },
     ]
 }
 
 fn warm(fleet: &mut Fleet, model: &str, port: u16) {
     fleet.observe(model, &Observation::LoadStarted, T0);
-    fleet.observe(model, &Observation::ProbeOk { vram_bytes: 21 * GIB }, T0 + 30 * SEC);
+    fleet.observe(
+        model,
+        &Observation::ProbeOk {
+            vram_bytes: 21 * GIB,
+        },
+        T0 + 30 * SEC,
+    );
     fleet.set_endpoint(model, format!("http://127.0.0.1:{port}"));
 }
 
@@ -68,7 +86,10 @@ fn a_detached_gpu_routes_elsewhere_without_blaming_anyone() {
     warm(&mut f, "muse-local:latest", 8081);
     f.observe(
         "muse-local:latest",
-        &Observation::ProbeFailed { gpu_present: false, detail: "no device".into() },
+        &Observation::ProbeFailed {
+            gpu_present: false,
+            detail: "no device".into(),
+        },
         T0 + 300 * SEC,
     );
 
@@ -79,7 +100,13 @@ fn a_detached_gpu_routes_elsewhere_without_blaming_anyone() {
         "the host took the card — scoring the operator down for that is the \
          bug that quietly deletes honest operators from a marketplace",
     );
-    assert!(matches!(r, Route::Lost { reason: LostReason::GpuDetached, .. }));
+    assert!(matches!(
+        r,
+        Route::Lost {
+            reason: LostReason::GpuDetached,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -88,11 +115,17 @@ fn an_eviction_does_count_against_the_operator() {
     warm(&mut f, "muse-local:latest", 8081);
     f.observe(
         "muse-local:latest",
-        &Observation::ProbeFailed { gpu_present: true, detail: "not loaded".into() },
+        &Observation::ProbeFailed {
+            gpu_present: true,
+            detail: "not loaded".into(),
+        },
         T0 + 300 * SEC,
     );
     let r = f.route("muse-local:latest", T0 + 300 * SEC);
-    assert!(r.operator_fault(), "over-committing the card IS theirs to fix");
+    assert!(
+        r.operator_fault(),
+        "over-committing the card IS theirs to fix"
+    );
 }
 
 #[test]
@@ -122,7 +155,13 @@ fn resident_with_nowhere_to_send_traffic_is_not_ready() {
     // port yet. Reporting Ready here hands the caller a hole to fall into.
     let mut f = Fleet::declare(card(), roster());
     f.observe("muse-local:latest", &Observation::LoadStarted, T0);
-    f.observe("muse-local:latest", &Observation::ProbeOk { vram_bytes: 21 * GIB }, T0 + SEC);
+    f.observe(
+        "muse-local:latest",
+        &Observation::ProbeOk {
+            vram_bytes: 21 * GIB,
+        },
+        T0 + SEC,
+    );
     assert!(matches!(
         f.route("muse-local:latest", T0 + SEC),
         Route::Unknown { .. }
@@ -145,7 +184,10 @@ fn committed_vram_is_measured_not_estimated() {
     // the card is full of models that are not there.
     f.observe(
         "muse-local:latest",
-        &Observation::ProbeFailed { gpu_present: false, detail: "gone".into() },
+        &Observation::ProbeFailed {
+            gpu_present: false,
+            detail: "gone".into(),
+        },
         T0 + 100 * SEC,
     );
     assert_eq!(f.live_committed_bytes(), 0);
@@ -194,7 +236,10 @@ fn a_lost_model_is_eligible_to_come_back() {
     warm(&mut f, "muse-local:latest", 8081);
     f.observe(
         "muse-local:latest",
-        &Observation::ProbeFailed { gpu_present: false, detail: "gone".into() },
+        &Observation::ProbeFailed {
+            gpu_present: false,
+            detail: "gone".into(),
+        },
         T0 + 100 * SEC,
     );
     assert_eq!(
@@ -210,7 +255,11 @@ fn a_deliberately_stopped_model_stays_stopped() {
     // asked it to shut down, which is maddening and looks like a bug.
     let mut f = Fleet::declare(card(), roster());
     warm(&mut f, "muse-local:latest", 8081);
-    f.observe("muse-local:latest", &Observation::StopRequested, T0 + 50 * SEC);
+    f.observe(
+        "muse-local:latest",
+        &Observation::StopRequested,
+        T0 + 50 * SEC,
+    );
     assert_eq!(
         f.next_to_load().map(|s| s.declared.model.as_str()),
         Some("deepseek-r1:32b"),
@@ -243,6 +292,9 @@ fn the_report_shows_every_model_and_why() {
     assert!(r.contains("muse-local:latest"));
     assert!(r.contains("resident for"));
     assert!(r.contains("loading for"));
-    assert!(r.contains("not admitted"), "gemma4 must appear WITH its reason");
+    assert!(
+        r.contains("not admitted"),
+        "gemma4 must appear WITH its reason"
+    );
     assert!(r.contains("3 declared, 2 admitted"));
 }

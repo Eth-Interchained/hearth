@@ -24,6 +24,6 @@ pub mod budget;
 pub mod fleet;
 pub mod residency;
 
-pub use fleet::{Fleet, Route, Slot};
 pub use budget::{plan, Budget, Declared, Plan, Rejection, GIB};
+pub use fleet::{Fleet, Route, Slot};
 pub use residency::{LostReason, Millis, Observation, Residency};

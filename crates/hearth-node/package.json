@@ -1,0 +1,18 @@
+{
+  "name": "@interchained/hearth",
+  "version": "0.1.0",
+  "description": "Deterministic model residency — keep declared models warm, and tell the truth about which ones are.",
+  "license": "BUSL-1.1",
+  "repository": { "type": "git", "url": "git+https://github.com/Eth-Interchained/hearth.git" },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "*.node"],
+  "napi": { "name": "hearth", "triples": { "defaults": true } },
+  "engines": { "node": ">= 18" },
+  "keywords": ["llm", "inference", "gpu", "vram", "residency", "ollama", "llama.cpp", "pin"],
+  "devDependencies": { "@napi-rs/cli": "^2.18.0" },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  }
+}

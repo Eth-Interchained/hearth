@@ -72,11 +72,15 @@ impl LostReason {
 }
 
 /// Where a model stands right now.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Residency {
     /// Declared but never observed. Not a failure — an absence of information,
     /// and worth its own state so nobody reports a guess as a fact.
+    ///
+    /// The default, deliberately: a fresh slot knows nothing, and "nothing
+    /// known" must never be confused with "known to be fine".
+    #[default]
     Unknown,
     /// Weights are materializing. Never fatal, however long it takes.
     Loading { since: Millis },
@@ -108,12 +112,6 @@ pub enum Observation {
     LoadFailed { detail: String },
     /// We asked for it to be unloaded.
     StopRequested,
-}
-
-impl Default for Residency {
-    fn default() -> Self {
-        Residency::Unknown
-    }
 }
 
 impl Residency {

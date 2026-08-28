@@ -233,7 +233,9 @@ impl Fleet {
             s.admitted
                 && !matches!(
                     s.state,
-                    Residency::Resident { .. } | Residency::Loading { .. } | Residency::Stopped { .. }
+                    Residency::Resident { .. }
+                        | Residency::Loading { .. }
+                        | Residency::Stopped { .. }
                 )
                 && s.declared.total_bytes() <= free
         })
