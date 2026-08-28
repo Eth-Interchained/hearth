@@ -402,6 +402,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
+name = "hearth-api"
+version = "0.3.4"
+dependencies = [
+ "hearth-core",
+ "serde_json",
+]
+
+[[package]]
 name = "hearth-core"
 version = "0.3.4"
 dependencies = [
@@ -451,6 +459,7 @@ dependencies = [
 name = "hearth-serve"
 version = "0.3.4"
 dependencies = [
+ "hearth-api",
  "hearth-core",
  "hearth-pull",
  "hearth-store",
