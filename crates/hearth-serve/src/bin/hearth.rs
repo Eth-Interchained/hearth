@@ -52,8 +52,9 @@ fn main() -> ExitCode {
         Some("why") => cmd_why(&args[1..]),
         Some("as-of") => cmd_as_of(&args[1..]),
         Some("verify") => cmd_verify(),
+        Some("pull") => cmd_pull(&args[1..]),
         _ => {
-            eprintln!("usage: hearth serve|status|why|as-of|verify (see crate docs)");
+            eprintln!("usage: hearth pull|serve|status|why|as-of|verify (see crate docs)");
             return ExitCode::from(2);
         }
     };
@@ -77,6 +78,48 @@ fn open_spine() -> Result<Spine, String> {
     let dir = hearth_home().join("spine");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Spine::open(&dir)
+}
+
+/// `hearth pull <reference>` — fetch weights, verify the digest, record it.
+///
+/// The recording is the part no other tool does. Months later, "where did this
+/// file come from" is `hearth why <model>` rather than an archaeology project.
+fn cmd_pull(args: &[String]) -> Result<(), String> {
+    let reference = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .ok_or("usage: hearth pull REFERENCE   (e.g. tinyllama, ollama:library/llama3:latest, file:./muse.gguf)")?;
+
+    let cfg = hearth_pull::PullConfig {
+        blobs_dir: match flag(args, "--blobs") {
+            Some(d) => d.into(),
+            None => hearth_home().join("blobs"),
+        },
+        // A silent multi-gigabyte pause is indistinguishable from a hang.
+        progress: !args.iter().any(|a| a == "--quiet"),
+        verify_existing: args.iter().any(|a| a == "--verify-existing"),
+    };
+
+    let spine = open_spine()?;
+    eprintln!("hearth: pulling {reference} …");
+    let out = hearth_pull::pull(reference, &cfg, &spine)?;
+    spine.flush();
+
+    let gib = out.bytes as f64 / GIB as f64;
+    if out.already_had_it {
+        println!("{} already here — {:.2} GiB", out.model, gib);
+    } else {
+        println!("{} pulled and verified — {:.2} GiB", out.model, gib);
+    }
+    println!("  from  {}", out.source);
+    println!("  at    {}", out.weights_path.display());
+    println!();
+    println!(
+        "  hearth serve --model {} --gguf {}",
+        out.model,
+        out.weights_path.display()
+    );
+    Ok(())
 }
 
 fn cmd_serve(args: &[String]) -> Result<(), String> {
@@ -177,9 +220,32 @@ fn cmd_why(args: &[String]) -> Result<(), String> {
     let model = args.first().ok_or("usage: hearth why MODEL")?;
     let spine = open_spine()?;
     let chain = spine.why(model);
-    if chain.is_empty() {
+    // Where the bytes came from is a different chain from why it is (not)
+    // resident, and both are part of the answer. Pull events live in their own
+    // collection; for one commit nothing read them, so this command claimed
+    // "no history" about a model it had just downloaded and verified.
+    let provenance = spine.provenance(model);
+
+    if chain.is_empty() && provenance.is_empty() {
         return Err(format!("{model} has no history in the spine"));
     }
+
+    if !provenance.is_empty() {
+        println!("where {model} came from:\n");
+        for (i, ev) in provenance.iter().enumerate() {
+            let arrow = if i == 0 { "●" } else { "└─" };
+            println!("{arrow} seq {:>5}  {:<14} {}", ev.seq, ev.kind, ev.facts);
+        }
+        if !chain.is_empty() {
+            println!();
+        }
+    }
+
+    if chain.is_empty() {
+        println!("(never served — the bytes are here, nothing has loaded them)");
+        return Ok(());
+    }
+
     println!("why {model} — causal chain, newest first:\n");
     for (i, ev) in chain.iter().enumerate() {
         let arrow = if i == 0 { "●" } else { "└─" };

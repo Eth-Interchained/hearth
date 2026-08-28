@@ -72,15 +72,20 @@ impl Reference {
             return Err(bad("empty model reference"));
         }
 
-        // A path is anything that looks like one. Checked FIRST, because a
-        // Windows path and a scheme prefix both contain a colon and the file
-        // on disk is the less surprising interpretation.
-        if looks_like_path(s) {
-            return Ok(Reference::Local {
-                path: s.to_string(),
-            });
-        }
-
+        // KNOWN schemes first. An explicit scheme is a statement of intent and
+        // cannot be ambiguous; the path heuristic below is a guess for input
+        // that made no statement.
+        //
+        // This used to be the other way round, to keep a Windows path like
+        // `C:\models\x.gguf` from being read as a scheme. That concern is real
+        // but it is already handled by only ever stripping the four schemes we
+        // know — `c` is not one of them. Checking the heuristic first had a
+        // worse consequence: `looks_like_path` matches anything ending in
+        // `.gguf`, so EVERY `file:` URL pointing at a GGUF matched it and kept
+        // its scheme, producing `Local { path: "file:/m/muse.gguf" }` — a path
+        // that cannot be opened. The `file:` branch below was dead code for
+        // every realistic input, and the heuristic meant to recognise GGUF
+        // files was what broke GGUF file URLs.
         if let Some(rest) = strip_scheme(s, "hf") {
             return parse_hf(rest);
         }
@@ -91,8 +96,18 @@ impl Reference {
             return parse_ollama(rest);
         }
         if let Some(rest) = strip_scheme(s, "file") {
+            if rest.is_empty() {
+                return Err(bad("file: needs a path"));
+            }
             return Ok(Reference::Local {
                 path: rest.to_string(),
+            });
+        }
+
+        // No scheme. Does it look like a path?
+        if looks_like_path(s) {
+            return Ok(Reference::Local {
+                path: s.to_string(),
             });
         }
 
@@ -252,4 +267,84 @@ fn parse_ollama(rest: &str) -> Result<Reference, ParseError> {
         name,
         tag,
     })
+}
+
+#[cfg(test)]
+mod file_scheme_tests {
+    use super::*;
+
+    /// The bug: `looks_like_path` matches anything ending in `.gguf`, and it
+    /// used to be checked before the scheme strips. So every `file:` URL
+    /// pointing at a GGUF — which is every realistic one — came back with its
+    /// scheme still attached, as a path that cannot be opened.
+    #[test]
+    fn a_file_url_yields_a_path_you_can_actually_open() {
+        for (input, want) in [
+            ("file:/models/muse.gguf", "/models/muse.gguf"),
+            ("file:./muse.gguf", "./muse.gguf"),
+            ("file:muse.gguf", "muse.gguf"),
+            // Not a .gguf, which is the one case that used to work — it fell
+            // past the heuristic and reached the scheme branch.
+            ("file:/models/model.bin", "/models/model.bin"),
+        ] {
+            match Reference::parse(input).expect(input) {
+                Reference::Local { path } => assert_eq!(path, want, "for {input}"),
+                other => panic!("{input} should be Local, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_bare_path_still_works_without_a_scheme() {
+        for input in ["/models/muse.gguf", "./muse.gguf", "~/models/muse.gguf"] {
+            match Reference::parse(input).expect(input) {
+                Reference::Local { path } => assert_eq!(path, input),
+                other => panic!("{input} should be Local, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_windows_path_is_not_mistaken_for_a_scheme() {
+        // The reason the heuristic was first. It is safe under the new order
+        // because only four known schemes are ever stripped, and `c` is not
+        // one of them.
+        for input in [r"C:\models\muse.gguf", "C:/models/muse.gguf"] {
+            match Reference::parse(input).expect(input) {
+                Reference::Local { path } => assert_eq!(path, input),
+                other => panic!("{input} should be Local, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_other_schemes_still_win_over_the_path_heuristic() {
+        // `hf:owner/repo` ending in something path-ish must remain a HF
+        // reference, not become a local file.
+        assert!(matches!(
+            Reference::parse("hf:TheBloke/X-GGUF").unwrap(),
+            Reference::HuggingFace { .. }
+        ));
+        assert!(matches!(
+            Reference::parse("ollama:library/llama3:latest").unwrap(),
+            Reference::Ollama { .. }
+        ));
+    }
+
+    #[test]
+    fn an_empty_file_scheme_is_an_error_not_an_empty_path() {
+        // `Local { path: "" }` would fail much later as "no such file: ''".
+        assert!(Reference::parse("file:").is_err());
+    }
+
+    #[test]
+    fn display_name_is_the_model_name_now_that_the_scheme_is_gone() {
+        // Basename with the extension trimmed: a model is called "muse", not
+        // "muse.gguf" and certainly not "file:/models/muse.gguf". Before the
+        // reorder this returned the whole scheme-prefixed string, which then
+        // became the model's key in the spine.
+        let r = Reference::parse("file:/models/muse.gguf").unwrap();
+        assert_eq!(r.display_name(), "muse");
+        assert_eq!(r.key(), "local//models/muse.gguf");
+    }
 }

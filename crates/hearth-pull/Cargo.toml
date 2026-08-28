@@ -1,0 +1,19 @@
+[package]
+name = "hearth-pull"
+description = "Fetch model weights from Ollama's registry or HuggingFace, digest-verified, with every step recorded in the spine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["llm", "gguf", "ollama", "huggingface", "download"]
+categories = ["network-programming", "command-line-utilities"]
+documentation = "https://docs.rs/hearth-pull"
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+hearth-core = { path = "../hearth-core", version = "0.3.3" }
+hearth-resolve = { path = "../hearth-resolve", version = "0.3.3" }
+hearth-store = { path = "../hearth-store", version = "0.3.3" }
+serde_json = { workspace = true }
