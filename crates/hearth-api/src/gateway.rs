@@ -86,6 +86,12 @@ pub enum Endpoint {
     /// Anything that names a model in its body and should reach the runtime.
     Inference,
     Models,
+    /// Ollama's native listing. Same facts as `Models`, DIFFERENT dialect —
+    /// an ollama-mode client deserializes `{"models":[…]}` and chokes on
+    /// OpenAI's `{"data":[…]}`. Found in production: pin-clientd polled
+    /// /api/tags on day one of the cutover and logged
+    /// "error decoding response body" against a perfectly healthy fleet.
+    ModelsOllama,
     Residency,
     Health,
     Unknown,
@@ -101,7 +107,8 @@ pub fn classify(path: &str) -> Endpoint {
         | "/v1/embeddings"
         | "/api/chat"
         | "/api/generate" => Endpoint::Inference,
-        "/v1/models" | "/api/tags" => Endpoint::Models,
+        "/v1/models" => Endpoint::Models,
+        "/api/tags" => Endpoint::ModelsOllama,
         "/residency" | "/v1/residency" => Endpoint::Residency,
         "/health" | "/healthz" | "/v1/health" => Endpoint::Health,
         _ => Endpoint::Unknown,
@@ -131,6 +138,9 @@ pub fn decide(path: &str, body: &str, fleet: &Fleet, now: Millis) -> Decision {
             json!({ "status": "ok", "service": "hearth" }),
         )),
         Endpoint::Models => Decision::Answer(Response::json(200, models_body(fleet, now))),
+        Endpoint::ModelsOllama => {
+            Decision::Answer(Response::json(200, ollama_tags_body(fleet, now)))
+        }
         Endpoint::Residency => Decision::Answer(Response::json(200, residency_body(fleet, now))),
         Endpoint::Unknown => Decision::Answer(Response::openai_error(
             404,
@@ -294,6 +304,46 @@ fn models_body(fleet: &Fleet, now: Millis) -> Value {
         })
         .collect();
     json!({ "object": "list", "data": data })
+}
+
+/// `/api/tags`, in OLLAMA's shape, because that is the contract of the path.
+///
+/// An ollama-mode client (pin-clientd, the ollama CLI, anything built on the
+/// ollama SDK) deserializes exactly this structure; answering with OpenAI's
+/// listing on ollama's path is a parse error on every poll. Only admitted
+/// models are listed — ollama's semantics are "models you can run", and a
+/// budget-refused model is not that. /v1/models and /residency still show
+/// everything, refusals included.
+fn ollama_tags_body(fleet: &Fleet, now: Millis) -> Value {
+    let models: Vec<Value> = fleet
+        .slots()
+        .iter()
+        .filter(|s| s.admitted)
+        .map(|s| {
+            json!({
+                "name": s.declared.model,
+                "model": s.declared.model,
+                // The moment of listing. hearth's real history lives in the
+                // spine; this field exists because the dialect requires it.
+                "modified_at": "1970-01-01T00:00:00Z",
+                "size": s.declared.total_bytes(),
+                "digest": "",
+                "details": {
+                    "format": "gguf",
+                    "family": "",
+                    "parameter_size": "",
+                    "quantization_level": "",
+                },
+                // Additive, same as everywhere else: ollama clients ignore it,
+                // and anything smarter learns whether the model can serve NOW.
+                "hearth": {
+                    "ready": s.state.is_ready(),
+                    "state": s.state.explain(now),
+                },
+            })
+        })
+        .collect();
+    json!({ "models": models })
 }
 
 /// `/residency` — the truth the OpenAI shape has no way to express.
@@ -530,7 +580,7 @@ mod tests {
         assert_eq!(classify("/v1/models"), Endpoint::Models);
         // Ollama's own listing path, so a tool pointed at hearth instead of
         // ollama does not have to be rewritten.
-        assert_eq!(classify("/api/tags"), Endpoint::Models);
+        assert_eq!(classify("/api/tags"), Endpoint::ModelsOllama);
         assert_eq!(classify("/residency"), Endpoint::Residency);
         assert_eq!(classify("/health"), Endpoint::Health);
         assert_eq!(classify("/nope"), Endpoint::Unknown);
@@ -600,6 +650,28 @@ mod tests {
         let whale = &v["data"][1];
         assert_eq!(whale["hearth"]["admitted"], json!(false));
         assert_eq!(whale["hearth"]["ready"], json!(false));
+    }
+
+    #[test]
+    fn api_tags_speaks_ollama_not_openai() {
+        // The production bug from cutover day one: pin-clientd in ollama mode
+        // polled /api/tags, got OpenAI's {"data":[…]}, and logged "error
+        // decoding response body" against a healthy fleet. The path IS the
+        // contract: ollama's path gets ollama's dialect.
+        let r = answer(decide("/api/tags", "", &fleet(), 0));
+        assert_eq!(r.status, 200);
+        let v: Value = serde_json::from_str(&r.body).unwrap();
+        assert!(v.get("models").is_some(), "ollama's key: {}", r.body);
+        assert!(v.get("data").is_none(), "not OpenAI's key");
+        let m = &v["models"][0];
+        for key in ["name", "model", "modified_at", "size", "digest", "details"] {
+            assert!(m.get(key).is_some(), "ollama clients deserialize {key}");
+        }
+        assert_eq!(m["name"], json!("muse"));
+        assert!(m["size"].as_u64().unwrap() > 0);
+        // Only admitted models: ollama semantics are "models you can run",
+        // and whale was refused by the budget.
+        assert_eq!(v["models"].as_array().unwrap().len(), 1);
     }
 
     #[test]
