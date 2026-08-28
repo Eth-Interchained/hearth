@@ -1,5 +1,11 @@
 //! Python bindings.
 //!
+// pyo3's #[pyfunction] / #[pymethods] macros expand to a PyErr -> PyErr
+// conversion that clippy flags as useless. It is useless, and it is also not
+// ours — the alternative is contorting real signatures to satisfy a lint about
+// generated code. Allowed here, narrowly, with the reason attached.
+#![allow(clippy::useless_conversion)]
+//!
 //! Same discipline as the Node side: every rule lives in `hearth-core` and is
 //! tested there once. This layer moves data and nothing else.
 //!

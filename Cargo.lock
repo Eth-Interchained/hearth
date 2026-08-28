@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-node"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "hearth-core",
  "napi",
@@ -69,10 +69,18 @@ dependencies = [
 
 [[package]]
 name = "hearth-py"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "hearth-core",
  "pyo3",
+ "serde_json",
+]
+
+[[package]]
+name = "hearth-resolve"
+version = "0.2.0"
+dependencies = [
+ "serde",
  "serde_json",
 ]
 

@@ -1,0 +1,386 @@
+//! From a reference to a list of bytes to fetch.
+//!
+//! Both catalogs eventually hand you the same thing — GGUF files over HTTPS —
+//! but they describe them completely differently, and neither description is
+//! usable as-is.
+//!
+//! **Ollama** serves an OCI manifest. The GGUF is one layer among several
+//! (there is also a template, a params blob, a licence), identified by media
+//! type. Everything is content-addressed, so the digest comes free.
+//!
+//! **HuggingFace** hands you a directory listing and no opinion. A popular
+//! repo has eight quantizations of the same model and it is on you to pick;
+//! big models are split into `00001-of-00003` parts that are useless
+//! individually. Sizes are often absent unless you ask for them.
+//!
+//! This module is the part that turns either of those into "fetch these bytes,
+//! expect this digest" — and it is pure, so every rule in it is testable
+//! without a network.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// One file to fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Blob {
+    pub url: String,
+    /// Where it lands, relative to the model's directory.
+    pub filename: String,
+    /// `sha256:...` when the catalog tells us. Ollama always does because it
+    /// is content-addressed; HuggingFace usually does not.
+    pub digest: Option<String>,
+    pub size_bytes: Option<u64>,
+}
+
+/// Everything needed to materialize one model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchPlan {
+    /// Stable identity — the reference's key.
+    pub key: String,
+    pub display_name: String,
+    /// In order. Multi-part GGUFs must be fetched and kept in sequence.
+    pub blobs: Vec<Blob>,
+    /// Which quantization we ended up with, and whether the caller chose it.
+    /// Surfaced because "you asked for a model and got Q4_K_M" is information
+    /// somebody will eventually need to explain a quality difference.
+    pub quant: Option<String>,
+    pub quant_was_chosen_for_you: bool,
+}
+
+impl FetchPlan {
+    pub fn total_bytes(&self) -> Option<u64> {
+        // All or nothing: a partial sum silently understates the download and
+        // would let the VRAM planner admit something that does not fit.
+        self.blobs.iter().map(|b| b.size_bytes).sum()
+    }
+
+    pub fn is_multipart(&self) -> bool {
+        self.blobs.len() > 1
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveError(pub String);
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+fn err(m: impl Into<String>) -> ResolveError {
+    ResolveError(m.into())
+}
+
+/* -------------------------------------------------------------- ollama -- */
+
+/// The layer media type that holds actual weights. The others in an Ollama
+/// manifest are the prompt template, the parameters and the licence, and
+/// downloading them as though they were the model is a 30-byte "model".
+pub const OLLAMA_MODEL_MEDIA_TYPE: &str = "application/vnd.ollama.image.model";
+
+/// Turn an Ollama OCI manifest into a fetch plan.
+///
+/// `base` is the registry root, e.g. `https://registry.ollama.ai`.
+pub fn plan_from_ollama_manifest(
+    manifest: &Value,
+    base: &str,
+    namespace: &str,
+    name: &str,
+    key: String,
+    display_name: String,
+) -> Result<FetchPlan, ResolveError> {
+    let layers = manifest
+        .get("layers")
+        .and_then(|l| l.as_array())
+        .ok_or_else(|| err("manifest has no layers array"))?;
+
+    let model_layers: Vec<&Value> = layers
+        .iter()
+        .filter(|l| l.get("mediaType").and_then(|m| m.as_str()) == Some(OLLAMA_MODEL_MEDIA_TYPE))
+        .collect();
+
+    if model_layers.is_empty() {
+        let seen: Vec<&str> = layers
+            .iter()
+            .filter_map(|l| l.get("mediaType").and_then(|m| m.as_str()))
+            .collect();
+        return Err(err(format!(
+            "no {OLLAMA_MODEL_MEDIA_TYPE} layer in this manifest — saw: {}",
+            if seen.is_empty() {
+                "nothing".to_string()
+            } else {
+                seen.join(", ")
+            }
+        )));
+    }
+
+    let mut blobs = Vec::with_capacity(model_layers.len());
+    for (i, layer) in model_layers.iter().enumerate() {
+        let digest = layer
+            .get("digest")
+            .and_then(|d| d.as_str())
+            .ok_or_else(|| err("a model layer has no digest"))?;
+        let size = layer.get("size").and_then(|s| s.as_u64());
+        blobs.push(Blob {
+            url: format!(
+                "{}/v2/{namespace}/{name}/blobs/{digest}",
+                base.trim_end_matches('/')
+            ),
+            filename: if model_layers.len() == 1 {
+                "model.gguf".to_string()
+            } else {
+                format!("model-{:05}.gguf", i + 1)
+            },
+            digest: Some(digest.to_string()),
+            size_bytes: size,
+        });
+    }
+
+    Ok(FetchPlan {
+        key,
+        display_name,
+        blobs,
+        // Ollama tags encode the quantization in the tag itself; the manifest
+        // does not name it separately, so claiming one would be inventing it.
+        quant: None,
+        quant_was_chosen_for_you: false,
+    })
+}
+
+/* --------------------------------------------------------- huggingface -- */
+
+/// Preference order when the caller did not pin a quantization.
+///
+/// Q4_K_M first because it is the one the community converged on: close to
+/// half the size of the f16 weights, and the quality loss is not the thing you
+/// notice. Descending from there through the K-quants, then the big ones.
+/// F16 is last on purpose — it is correct and almost always the wrong default,
+/// since it will not fit next to anything else on one card.
+pub const QUANT_PREFERENCE: &[&str] = &[
+    "Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_0", "Q4_0", "Q3_K_M", "F16",
+];
+
+/// One file in a HuggingFace repo listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoFile {
+    pub path: String,
+    pub size_bytes: Option<u64>,
+}
+
+/// Pick the GGUF files for one quantization.
+///
+/// Returns every part of a multi-part model, in order, because half of a
+/// split GGUF is not a model — and picking one part and calling it done is a
+/// download that succeeds and then fails to load with a confusing error.
+pub fn pick_gguf(
+    files: &[RepoFile],
+    wanted: Option<&str>,
+) -> Result<(Vec<RepoFile>, String, bool), ResolveError> {
+    let ggufs: Vec<&RepoFile> = files
+        .iter()
+        .filter(|f| f.path.to_ascii_lowercase().ends_with(".gguf"))
+        .collect();
+    if ggufs.is_empty() {
+        return Err(err(
+            "no .gguf files in this repo — hearth serves GGUF, so a repo of \
+             safetensors needs converting first",
+        ));
+    }
+
+    let available = available_quants(&ggufs);
+
+    let (chosen, was_chosen_for_you) = match wanted {
+        Some(w) => {
+            let up = w.to_ascii_uppercase();
+            if !available.iter().any(|q| q == &up) {
+                return Err(err(format!(
+                    "no {up} in this repo — available: {}",
+                    if available.is_empty() {
+                        "none detected".into()
+                    } else {
+                        available.join(", ")
+                    }
+                )));
+            }
+            (up, false)
+        }
+        None => {
+            let pick = QUANT_PREFERENCE
+                .iter()
+                .find(|p| available.iter().any(|q| q == *p))
+                .map(|p| p.to_string())
+                // A repo with exactly one GGUF and an unrecognized name is
+                // still perfectly usable — take it rather than refusing.
+                .or_else(|| (ggufs.len() == 1).then(|| "unknown".to_string()))
+                .ok_or_else(|| {
+                    err(format!(
+                        "could not choose between: {} — pin one with @QUANT",
+                        available.join(", ")
+                    ))
+                })?;
+            (pick, true)
+        }
+    };
+
+    let mut parts: Vec<RepoFile> = if chosen == "unknown" {
+        ggufs.iter().map(|f| (*f).clone()).collect()
+    } else {
+        ggufs
+            .iter()
+            .filter(|f| quant_of(&f.path).as_deref() == Some(chosen.as_str()))
+            .map(|f| (*f).clone())
+            .collect()
+    };
+
+    // Sorted so `00002-of-00003` follows `00001-of-00003` regardless of the
+    // order the API listed them in.
+    parts.sort_by(|a, b| a.path.cmp(&b.path));
+
+    if let Some(expected) = parts.iter().find_map(|f| total_parts(&f.path)) {
+        if parts.len() as u32 != expected {
+            return Err(err(format!(
+                "{chosen} is split into {expected} parts but only {} are present — \
+                 an incomplete split GGUF will download fine and then fail to load",
+                parts.len()
+            )));
+        }
+    }
+
+    Ok((parts, chosen, was_chosen_for_you))
+}
+
+/// Every quantization this repo appears to offer.
+pub fn available_quants(files: &[&RepoFile]) -> Vec<String> {
+    let mut out: Vec<String> = files.iter().filter_map(|f| quant_of(&f.path)).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The quantization named in a filename, if one is.
+///
+/// GGUF naming is a convention, not a standard: `model.Q4_K_M.gguf`,
+/// `model-q4_k_m.gguf`, `Model.IQ3_XS.gguf`. Matching on the token between
+/// separators handles all of them without a regex dependency.
+pub fn quant_of(path: &str) -> Option<String> {
+    let stem = path.rsplit('/').next().unwrap_or(path);
+    let stem = stem
+        .strip_suffix(".gguf")
+        .or_else(|| stem.strip_suffix(".GGUF"))?;
+    stem.split(['.', '-', '_'])
+        .collect::<Vec<_>>()
+        .windows(1)
+        .filter_map(|w| w.first().copied())
+        // Reassemble multi-token quants (Q4_K_M splits on '_') by scanning the
+        // original stem for each known name instead of trusting the split.
+        .next()
+        .and_then(|_| {
+            let upper = stem.to_ascii_uppercase();
+            KNOWN_QUANTS
+                .iter()
+                .filter(|q| is_token(&upper, q))
+                // Longest match wins: Q4_K_M must not be reported as Q4_K.
+                .max_by_key(|q| q.len())
+                .map(|q| q.to_string())
+        })
+}
+
+/// Every quantization name we recognize, longest-match-wins at lookup.
+const KNOWN_QUANTS: &[&str] = &[
+    "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q3_K", "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q4_K",
+    "Q5_0", "Q5_1", "Q5_K_S", "Q5_K_M", "Q5_K", "Q6_K", "Q8_0", "IQ1_S", "IQ2_XXS", "IQ2_XS",
+    "IQ3_XXS", "IQ3_XS", "IQ4_XS", "IQ4_NL", "F16", "FP16", "BF16", "F32",
+];
+
+/// Is `needle` present in `hay` as a whole token rather than a substring?
+/// Without this, `Q4_K` matches inside `Q4_K_M` and the wrong file gets picked.
+fn is_token(hay: &str, needle: &str) -> bool {
+    let bytes = hay.as_bytes();
+    let n = needle.as_bytes();
+    let sep = |b: u8| !(b.is_ascii_alphanumeric());
+    let mut i = 0;
+    while let Some(pos) = hay[i..].find(needle) {
+        let start = i + pos;
+        let end = start + n.len();
+        let before_ok = start == 0 || sep(bytes[start - 1]);
+        let after_ok = end == bytes.len() || sep(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        i = start + 1;
+        if i >= hay.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// `...-00001-of-00003.gguf` -> 3
+pub fn total_parts(path: &str) -> Option<u32> {
+    let stem = path.rsplit('/').next()?;
+    let idx = stem.to_ascii_lowercase().find("-of-")?;
+    let after = &stem[idx + 4..];
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Where in HuggingFace a set of files lives.
+///
+/// A struct rather than four more positional `&str`s: `(owner, repo,
+/// revision)` are all strings, so transposing two of them compiles perfectly
+/// and produces a download URL for a repo that does not exist. Named fields
+/// make that mistake unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfSource<'a> {
+    pub owner: &'a str,
+    pub repo: &'a str,
+    pub revision: &'a str,
+}
+
+/// What we settled on, and whether the caller or hearth decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuantChoice {
+    pub quant: String,
+    pub chosen_for_you: bool,
+}
+
+/// Build the plan once the files are chosen.
+pub fn plan_from_hf_files(
+    src: HfSource<'_>,
+    files: Vec<RepoFile>,
+    choice: QuantChoice,
+    key: String,
+    display_name: String,
+) -> FetchPlan {
+    let (owner, repo, revision) = (src.owner, src.repo, src.revision);
+    let QuantChoice {
+        quant,
+        chosen_for_you,
+    } = choice;
+    let blobs = files
+        .into_iter()
+        .map(|f| Blob {
+            url: format!(
+                "https://huggingface.co/{owner}/{repo}/resolve/{revision}/{}",
+                f.path
+            ),
+            filename: f.path.rsplit('/').next().unwrap_or(&f.path).to_string(),
+            // HuggingFace does not put a content digest in the file listing.
+            // Saying None is honest; inventing one would make verification a
+            // ritual that always passes.
+            digest: None,
+            size_bytes: f.size_bytes,
+        })
+        .collect();
+
+    FetchPlan {
+        key,
+        display_name,
+        blobs,
+        quant: Some(quant),
+        quant_was_chosen_for_you: chosen_for_you,
+    }
+}

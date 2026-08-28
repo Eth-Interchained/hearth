@@ -11,7 +11,7 @@ authors.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-hearth-core = { path = "../hearth-core", version = "0.1.0" }
+hearth-core = { path = "../hearth-core", version = "0.2.0" }
 napi = { version = "2", default-features = false, features = ["napi6", "serde-json"] }
 napi-derive = "2"
 serde_json = { workspace = true }

@@ -23,8 +23,8 @@ jobs:
       # The core is pure logic and needs no GPU, which is the whole point:
       # every rule about residency and VRAM is verifiable on a machine that
       # has never seen a model.
-      - name: test core
-        run: cargo test -p hearth-core --all-targets
+      - name: test the pure crates
+        run: cargo test -p hearth-core -p hearth-resolve --all-targets
 
       # The bindings only have to COMPILE here. They contain no rules — if a
       # binding needed its own tests, it would mean logic had leaked into it.
@@ -35,7 +35,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy -p hearth-core --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: the A6000 case, out loud
         run: cargo run -p hearth-core --example a6000
