@@ -157,16 +157,22 @@ jobs:
           merge-multiple: true
       - name: assemble platform packages
         working-directory: crates/hearth-node
+        # The npm/<platform>/ directories are committed, so `artifacts` has
+        # somewhere to copy each addon. v0.1.1 failed exactly here: all four
+        # .node files downloaded fine and there was nowhere to put them.
         run: |
           ls -la artifacts
           npx napi artifacts --dir artifacts
-          ls -la npm/*/ || true
+          for d in npm/*/; do echo "$d"; ls -la "$d"; done
       - name: publish
         working-directory: crates/hearth-node
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         # prepublish pushes each per-platform package; the main package's
         # optionalDependencies then resolve to whichever one fits the installer.
+        # No `|| true` anywhere here on purpose. Masking a publish failure is
+        # how v0.1.0 shipped a Node addon that silently ate its own input —
+        # a step that cannot fail is a step that cannot tell you anything.
         run: |
-          npx napi prepublish -t npm --skip-gh-release || true
-          npm publish --access public || echo "main package already at this version"
+          npx napi prepublish -t npm --skip-gh-release
+          npm publish --access public

@@ -1,0 +1,33 @@
+{
+  "name": "@interchained/hearth-darwin-x64",
+  "version": "0.1.2",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "hearth.darwin-x64.node",
+  "files": [
+    "hearth.darwin-x64.node"
+  ],
+  "description": "Deterministic model residency — keep declared models warm, and tell the truth about which ones are.",
+  "keywords": [
+    "llm",
+    "inference",
+    "gpu",
+    "vram",
+    "residency",
+    "ollama",
+    "llama.cpp",
+    "pin"
+  ],
+  "license": "BUSL-1.1",
+  "engines": {
+    "node": ">= 18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Eth-Interchained/hearth.git"
+  }
+}
