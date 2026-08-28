@@ -56,8 +56,11 @@ fn main() -> ExitCode {
         Some("verify") => cmd_verify(),
         Some("pull") => cmd_pull(&args[1..]),
         Some("up") => cmd_up(&args[1..]),
+        Some("preload") => cmd_preload(&args[1..]),
         _ => {
-            eprintln!("usage: hearth up|pull|serve|status|why|as-of|verify (see crate docs)");
+            eprintln!(
+                "usage: hearth up|preload|pull|serve|status|why|as-of|verify (see crate docs)"
+            );
             return ExitCode::from(2);
         }
     };
@@ -106,6 +109,180 @@ fn tunable<T: std::str::FromStr>(args: &[String], flag_name: &str, env: &str, de
         eprintln!("hearth: {env}={v:?} is not a valid value — using the default");
     }
     default
+}
+
+/// Every value of a repeatable flag, accepting both `--k v` and `--k=v` —
+/// Mark writes `--preload-model=name`, scripts often write `--preload-model name`,
+/// and a flag that only honours one spelling silently drops the other.
+fn flag_all(args: &[String], name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let prefix = format!("{name}=");
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(v) = args[i].strip_prefix(&prefix) {
+            out.push(v.to_string());
+        } else if args[i] == name {
+            if let Some(v) = args.get(i + 1) {
+                out.push(v.clone());
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// One-shot form of `flag_all` — last occurrence wins, both spellings.
+fn flag_eq(args: &[String], name: &str) -> Option<String> {
+    flag_all(args, name).pop()
+}
+
+/// Warm one resident model: a single-token generation straight at its
+/// endpoint. Returns milliseconds on success.
+fn warm_one(endpoint: &str, timeout: Duration) -> Result<u128, String> {
+    use std::io::{Read, Write};
+    let addr: std::net::SocketAddr = endpoint
+        .parse()
+        .map_err(|e| format!("bad endpoint {endpoint}: {e}"))?;
+    let started = std::time::Instant::now();
+    let mut s = std::net::TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|e| format!("connect: {e}"))?;
+    // Generous read deadline rather than none: warmup is the one place a
+    // bound is right, because it is our OWN throwaway request — a warmup that
+    // hangs must not wedge the warmer thread for the rest of the night.
+    let _ = s.set_read_timeout(Some(Duration::from_secs(300)));
+    let body = hearth_serve::warmup::warmup_request_body();
+    let req = format!(
+        "POST /completion HTTP/1.1\r\nhost: {endpoint}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    let head = String::from_utf8_lossy(&buf);
+    let status: Option<u16> = head.split_whitespace().nth(1).and_then(|c| c.parse().ok());
+    if hearth_serve::warmup::warmup_succeeded(status) {
+        Ok(started.elapsed().as_millis())
+    } else {
+        Err(format!(
+            "warmup answered {status:?}: {}",
+            head.chars().take(120).collect::<String>()
+        ))
+    }
+}
+
+/// `hearth preload NAME [NAME…] | '*'` — warm models on a RUNNING fleet.
+///
+/// Goes through the gateway's /residency to find endpoints, then fires the
+/// one-token generation at each. `*` warms every model that is ready.
+fn cmd_preload(args: &[String]) -> Result<(), String> {
+    let port: u16 = tunable(args, "--port", "HEARTH_PORT", 11434);
+    // Positionals are what remains after flags AND their values. A naive
+    // "everything not starting with --" filter swallowed the VALUE of
+    // `--port 18266` as a model name and then reported that 18266 was not
+    // declared — true, useless, and confusing. Found by running it.
+    let names: Vec<String> = {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            if args[i].starts_with("--") {
+                // `--k=v` is one token; `--k v` is two.
+                i += if args[i].contains('=') { 1 } else { 2 };
+            } else {
+                out.push(args[i].clone());
+                i += 1;
+            }
+        }
+        out
+    };
+    if names.is_empty() {
+        return Err(
+            "usage: hearth preload MODEL [MODEL…] | '*'   (against a running `hearth up`)".into(),
+        );
+    }
+
+    // Ask the running fleet what exists and where.
+    let health = hearth_serve::probe::probe_http(
+        &format!("127.0.0.1:{port}"),
+        "/residency",
+        Duration::from_secs(3),
+    );
+    let body = match &health {
+        hearth_serve::probe::ProbeResult::Ok => {
+            // probe_http discards bodies; fetch it plainly.
+            fetch_local_json(port, "/residency")?
+        }
+        other => {
+            return Err(format!(
+                "no hearth gateway answering on 127.0.0.1:{port} ({other:?}) — start one with `hearth up`"
+            ))
+        }
+    };
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("/residency was not json: {e}"))?;
+    let models = v["models"].as_array().cloned().unwrap_or_default();
+
+    let wanted_all = names.iter().any(|n| n == "*");
+    let mut warmed = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+    for m in &models {
+        let name = m["model"].as_str().unwrap_or("");
+        if !wanted_all && !names.iter().any(|n| n == name) {
+            continue;
+        }
+        if m["ready"] != serde_json::json!(true) {
+            skipped.push(format!("{name} ({})", m["state"].as_str().unwrap_or("?")));
+            continue;
+        }
+        let endpoint = m["endpoint"].as_str().unwrap_or("");
+        match warm_one(endpoint, Duration::from_secs(5)) {
+            Ok(ms) => {
+                println!("warmed {name} in {ms}ms");
+                warmed += 1;
+            }
+            Err(e) => eprintln!("hearth: {name} warmup FAILED — {e}"),
+        }
+    }
+    if !wanted_all {
+        for n in &names {
+            if !models
+                .iter()
+                .any(|m| m["model"] == serde_json::json!(n.as_str()))
+            {
+                eprintln!("hearth: {n} is not declared on this fleet — check `hearth preload '*'` output or /v1/models");
+            }
+        }
+    }
+    for s in &skipped {
+        eprintln!("hearth: skipped {s} — not ready; it will be warm the moment it turns resident if the fleet was started with preload on");
+    }
+    if warmed == 0 && skipped.is_empty() {
+        return Err("nothing matched — nothing warmed".into());
+    }
+    Ok(())
+}
+
+/// GET a small JSON body off the local gateway. Bounded, plain, no deps.
+fn fetch_local_json(port: u16, path: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().unwrap(),
+        Duration::from_secs(3),
+    )
+    .map_err(|e| format!("connect: {e}"))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    s.write_all(
+        format!("GET {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nconnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .map_err(|e| format!("write: {e}"))?;
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    let raw = String::from_utf8_lossy(&buf);
+    raw.split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .ok_or_else(|| "no body in the gateway's answer".into())
 }
 
 fn cmd_pull(args: &[String]) -> Result<(), String> {
@@ -236,6 +413,33 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
         }
     }
 
+    // Auto-preload: which models get a first-token warmup the moment they
+    // turn resident. Default is ALL admitted models — preloading is the
+    // product; opting out (--preload-models=0) is the special case.
+    let preload_n: Option<usize> = flag_eq(args, "--preload-models")
+        .or_else(|| std::env::var("HEARTH_PRELOAD_MODELS").ok())
+        .and_then(|v| v.parse().ok());
+    let preload_named: Vec<String> = {
+        let mut named = flag_all(args, "--preload-model");
+        if let Ok(env_named) = std::env::var("HEARTH_PRELOAD_MODEL") {
+            named.extend(
+                env_named
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            );
+        }
+        named
+    };
+    let declared_names: Vec<String> = specs.iter().map(|(n, _, _)| n.clone()).collect();
+    for unknown in hearth_serve::warmup::unknown_targets(&declared_names, &preload_named) {
+        // A typo that silently warms nothing is a cold model discovered by
+        // the first user of the day. Loud, not fatal.
+        eprintln!("hearth: --preload-model {unknown}: not declared on this fleet — ignoring");
+    }
+    let warm_list =
+        hearth_serve::warmup::warmup_targets(&declared_names, preload_n, &preload_named);
+
     let addr = format!("127.0.0.1:{api_port}");
     let server = hearth_api::Server::bind(&addr)?;
 
@@ -274,6 +478,51 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
     println!("  POST /v1/chat/completions   routed by the \"model\" field");
     println!("  GET  /v1/models             what is declared, and what is ready");
     println!("  GET  /residency             the truth the OpenAI shape cannot carry");
+
+    // The warmer: one thread, working through the preload list IN ORDER —
+    // warming simultaneously would contend for the GPU while models are still
+    // loading, turning a warmup into a slowdown. It waits for each model to
+    // turn resident (no deadline: a 32B over a network fabric takes what it
+    // takes), fires one throwaway token, and reports the time. After this,
+    // the first REAL request finds the graph built and the KV cache ready.
+    if !warm_list.is_empty() {
+        println!(
+            "  preload: {} model(s) will be warmed as they turn resident",
+            warm_list.len()
+        );
+        let warmer = Arc::clone(&sup);
+        std::thread::spawn(move || {
+            for model in warm_list {
+                loop {
+                    if SHUTDOWN.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let route = {
+                        let s = match warmer.lock() {
+                            Ok(s) => s,
+                            Err(_) => return,
+                        };
+                        s.fleet().route(&model, hearth_serve::now_ms())
+                    };
+                    match route {
+                        hearth_core::fleet::Route::Ready { endpoint, .. } => {
+                            match warm_one(&endpoint, Duration::from_secs(5)) {
+                                Ok(ms) => eprintln!("hearth: warmed {model} in {ms}ms — first real request will be hot"),
+                                Err(e) => eprintln!("hearth: {model} warmup FAILED — {e}"),
+                            }
+                            break;
+                        }
+                        // Never coming (refused, failed, undeclared): move on
+                        // rather than wait for a residency that cannot happen.
+                        hearth_core::fleet::Route::NotAdmitted { .. }
+                        | hearth_core::fleet::Route::NotDeclared { .. }
+                        | hearth_core::fleet::Route::Failed { .. } => break,
+                        _ => std::thread::sleep(Duration::from_millis(500)),
+                    }
+                }
+            }
+        });
+    }
 
     // The supervisor ticks on its own thread so a long generation never stalls
     // residency tracking, and so the accept loop is never the thing holding

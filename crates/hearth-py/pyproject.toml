@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "hearth-engine"
-version = "0.3.7"
+version = "0.3.8"
 description = "Deterministic model residency — keep declared models warm, and tell the truth about which ones are."
 readme = "README.md"
 license = { text = "BUSL-1.1" }
