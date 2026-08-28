@@ -22,9 +22,11 @@
 
 pub mod budget;
 pub mod fleet;
+pub mod gguf;
 pub mod residency;
 pub mod sha256;
 
-pub use budget::{plan, Budget, Declared, Plan, Rejection, GIB};
+pub use budget::{plan, total_ctx_tokens, Budget, Declared, Plan, Rejection, GIB};
 pub use fleet::{Fleet, Route, Slot};
+pub use gguf::{read_kv_shape, KvShape};
 pub use residency::{LostReason, Millis, Observation, Residency};

@@ -308,6 +308,125 @@ fn one_a6000_cannot_hold_the_roster_that_was_declared_on_it() {
 }
 
 #[test]
+fn a_second_model_that_could_not_fit_the_kv_left_over_is_rejected_at_declare_time() {
+    // THE INCIDENT ITSELF, not the roster from day one above.
+    //
+    // 2026-08-28: two models, both individually well under a 48 GiB card by
+    // weight size — muse-local:latest (~15.6 GiB Q4 weights) and
+    // qwen2.5:14b (~8.4 GiB Q4 weights). `kv_bytes: 0` on both, because
+    // nothing computed it. The planner said they fit. muse's OWN KV cache —
+    // computed properly here, the way `hearth::kv_bytes_for_model` now does
+    // from its GGUF header — turned out to be the ~14 GiB the incident
+    // measured (32 blocks, 8 KV heads, 128-wide keys and values, 32768
+    // tokens of total context from 8 slots with no --ctx set). qwen's own
+    // CUDA allocation then failed against what was left, and its
+    // `llama-server` process exited with no error text.
+    //
+    // With `kv_bytes` actually populated, this is not a runtime crash three
+    // minutes into a load — it is a same-millisecond REJECTION, with the
+    // exact shortfall in the message, before either process starts.
+    let card = Budget::with_reserve_pct(48 * GIB, 8);
+
+    // muse's real shape: 32 blocks, 8 KV heads (GQA), 128-wide K/V, 8 slots
+    // with no explicit --ctx (n_ctx_slot=4096 was observed on the real box,
+    // so total context = 4096 * 8 = 32768 — the "unset ctx multiplies by
+    // parallel" rule this fix's total_ctx_tokens encodes).
+    let muse_kv_shape = hearth_core::gguf::KvShape {
+        block_count: 32,
+        head_count_kv: 8,
+        key_length: 128,
+        value_length: 128,
+        context_length: 4096,
+    };
+    let muse_total_ctx = hearth_core::total_ctx_tokens(0, muse_kv_shape.context_length, 8);
+    let muse_kv_bytes = muse_kv_shape.kv_bytes_for(muse_total_ctx);
+
+    let declared = vec![
+        Declared {
+            model: "muse-local:latest".into(),
+            weights_bytes: (156 * GIB) / 10, // ~15.6 GiB, the real blob size
+            kv_bytes: muse_kv_bytes,
+        },
+        Declared {
+            model: "qwen2.5:14b".into(),
+            weights_bytes: (837 * GIB) / 100, // ~8.37 GiB, the real pulled size
+            // Same treatment: 40 heads / 8 KV heads (GQA), 128-wide K/V,
+            // 32768 native context, 2 slots (the fleet.conf change that
+            // actually fixed the incident).
+            kv_bytes: hearth_core::gguf::KvShape {
+                block_count: 48,
+                head_count_kv: 8,
+                key_length: 128,
+                value_length: 128,
+                context_length: 32_768,
+            }
+            .kv_bytes_for(hearth_core::total_ctx_tokens(0, 32_768, 2)),
+        },
+    ];
+
+    // Reproduce the incident first: BOTH declared at parallel 8, kv_bytes 0
+    // (nothing computed) — this is what actually shipped, and it is why the
+    // planner said yes to a roster that then died on real VRAM.
+    let unaccounted = vec![
+        Declared {
+            model: declared[0].model.clone(),
+            weights_bytes: declared[0].weights_bytes,
+            kv_bytes: 0,
+        },
+        Declared {
+            model: declared[1].model.clone(),
+            weights_bytes: declared[1].weights_bytes,
+            kv_bytes: 0,
+        },
+    ];
+    let blind = plan(card, &unaccounted);
+    assert!(
+        blind.fits(),
+        "the incident's own shape: weights alone fit comfortably, which is \
+         exactly how this got past the planner and into a CUDA allocation \
+         failure at load time"
+    );
+
+    // Now with real KV accounting at parallel 8 for BOTH — the shape that
+    // actually failed on the card, reproduced with the fix's own arithmetic.
+    let both_at_parallel_8 = vec![
+        declared[0].clone(),
+        Declared {
+            model: declared[1].model.clone(),
+            weights_bytes: declared[1].weights_bytes,
+            kv_bytes: hearth_core::gguf::KvShape {
+                block_count: 48,
+                head_count_kv: 8,
+                key_length: 128,
+                value_length: 128,
+                context_length: 32_768,
+            }
+            .kv_bytes_for(hearth_core::total_ctx_tokens(0, 32_768, 8)),
+        },
+    ];
+    let honest = plan(card, &both_at_parallel_8);
+    assert!(
+        !honest.fits(),
+        "with KV cache actually counted, the second model must be REJECTED \
+         at declare time, not left to fail inside a CUDA allocator with no \
+         error text three minutes into a load"
+    );
+    assert_eq!(honest.admitted, vec!["muse-local:latest"]);
+    assert_eq!(honest.rejected[0].model, "qwen2.5:14b");
+    assert!(honest.explain().contains("REJECTED qwen2.5:14b"));
+
+    // And the fix that actually resolved it in production — dropping
+    // parallel to 2 — is exactly what the planner now says fits.
+    let fixed = plan(card, &declared);
+    assert!(
+        fixed.fits(),
+        "parallel 2 on both models is the configuration that actually \
+         worked on the real box; the planner must agree, not just refuse \
+         everything more conservative"
+    );
+}
+
+#[test]
 fn declaration_order_is_priority_order() {
     // First fit, never best fit. Reordering to squeeze in one more model would
     // silently demote the model the operator listed first — and on a serving

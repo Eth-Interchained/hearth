@@ -133,6 +133,33 @@ pub fn gib(bytes: u64) -> f64 {
     bytes as f64 / GIB as f64
 }
 
+/// The total KV-cache context a running server will actually hold, given
+/// hearth's own `--ctx` flag and the GGUF's native context length.
+///
+/// The two cases are NOT the same shape, and getting them backwards is how
+/// this went uncaught: hearth's `--ctx` is documented — correctly — as the
+/// TOTAL context, pre-divided across `--parallel` slots by llama-server
+/// itself (`--ctx 8192 --parallel 4` gives each caller 2048, not 8192). But
+/// when `--ctx` is left at 0, llama-server does not divide anything; each of
+/// the `parallel` slots gets its own full copy of the model's native
+/// `context_length`. The total footprint in that case is the native length
+/// MULTIPLIED by slot count, not left alone.
+///
+///   ctx explicit (> 0): total = ctx                (already pre-divided)
+///   ctx unset (== 0):   total = native_ctx * parallel   (each slot gets one)
+///
+/// Measured against the actual `n_ctx_slot = 4096` server log line at
+/// `--parallel 8` with no `--ctx` passed: that is a per-slot number that did
+/// not shrink as slots were added, which only makes sense if the total grew
+/// with them.
+pub fn total_ctx_tokens(ctx_flag: u32, native_context_length: u64, parallel: u32) -> u64 {
+    if ctx_flag > 0 {
+        ctx_flag as u64
+    } else {
+        native_context_length.saturating_mul(parallel.max(1) as u64)
+    }
+}
+
 /// Decide what can be held resident, in declaration order.
 ///
 /// First fit, not best fit, and deliberately so. Reordering to squeeze in one
@@ -258,4 +285,36 @@ fn one_declared(v: &serde_json::Value) -> Result<Declared, String> {
         weights_bytes: weights,
         kv_bytes: kv,
     })
+}
+
+#[cfg(test)]
+mod ctx_tests {
+    use super::total_ctx_tokens;
+
+    #[test]
+    fn explicit_ctx_is_already_the_total() {
+        // hearth's own documented contract for --ctx: pre-divided across
+        // slots by llama-server. The total does not grow with parallel.
+        assert_eq!(total_ctx_tokens(8192, 32_768, 4), 8192);
+        assert_eq!(total_ctx_tokens(8192, 32_768, 1), 8192);
+    }
+
+    #[test]
+    fn unset_ctx_multiplies_native_length_by_parallel() {
+        // The behaviour that produced the incident: each slot gets its own
+        // full copy of the model's native window when nothing was passed.
+        assert_eq!(total_ctx_tokens(0, 4096, 8), 32_768);
+    }
+
+    #[test]
+    fn zero_parallel_is_treated_as_one_slot_not_zero_context() {
+        // A caller that forgot to set parallel should not silently zero out
+        // the whole KV budget and let everything past it look free.
+        assert_eq!(total_ctx_tokens(0, 4096, 0), 4096);
+    }
+
+    #[test]
+    fn explicit_ctx_ignores_parallel_entirely() {
+        assert_eq!(total_ctx_tokens(1024, 999_999, 64), 1024);
+    }
 }
