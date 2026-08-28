@@ -1,6 +1,6 @@
 {
   "name": "@interchained/hearth-win32-x64-msvc",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "os": [
     "win32"
   ],
@@ -11,7 +11,7 @@
   "files": [
     "hearth.win32-x64-msvc.node"
   ],
-  "description": "Deterministic model residency — keep declared models warm, and tell the truth about which ones are.",
+  "description": "Deterministic model residency \u2014 keep declared models warm, and tell the truth about which ones are.",
   "keywords": [
     "llm",
     "inference",
@@ -29,5 +29,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Eth-Interchained/hearth.git"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

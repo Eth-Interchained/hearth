@@ -1,6 +1,6 @@
 {
   "name": "@interchained/hearth",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Deterministic model residency \u2014 keep declared models warm, and tell the truth about which ones are.",
   "license": "BUSL-1.1",
   "repository": {
@@ -45,5 +45,8 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
