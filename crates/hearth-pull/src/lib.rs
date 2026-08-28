@@ -23,6 +23,7 @@
 
 pub mod curl;
 pub mod registry;
+pub mod runtime;
 
 use std::path::{Path, PathBuf};
 

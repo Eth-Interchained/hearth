@@ -159,7 +159,22 @@ impl ServerChild {
             std::fs::File::create(spec.log_path("out")).map_err(|e| format!("log file: {e}"))?;
         let stderr =
             std::fs::File::create(spec.log_path("err")).map_err(|e| format!("log file: {e}"))?;
-        let child = Command::new(&spec.binary)
+        let mut cmd = Command::new(&spec.binary);
+        // A fetched runtime keeps its shared libraries next to the binary;
+        // without this, a prebuilt llama-server dies on ggml .so lookups and
+        // reads as "started, then died".
+        if let Some(dir) = spec.binary.parent() {
+            if dir.components().count() > 0 {
+                let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+                let joined = if existing.is_empty() {
+                    dir.display().to_string()
+                } else {
+                    format!("{}:{existing}", dir.display())
+                };
+                cmd.env("LD_LIBRARY_PATH", joined);
+            }
+        }
+        let child = cmd
             .args(spec.argv())
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
