@@ -11,8 +11,10 @@
 //! they answer from the recorded history whether or not a supervisor is
 //! running, because the history is the database, not a process's memory.
 
+use std::io::Write;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// SIGINT/SIGTERM latch. The handler only flips a bool — all real work
@@ -53,8 +55,9 @@ fn main() -> ExitCode {
         Some("as-of") => cmd_as_of(&args[1..]),
         Some("verify") => cmd_verify(),
         Some("pull") => cmd_pull(&args[1..]),
+        Some("up") => cmd_up(&args[1..]),
         _ => {
-            eprintln!("usage: hearth pull|serve|status|why|as-of|verify (see crate docs)");
+            eprintln!("usage: hearth up|pull|serve|status|why|as-of|verify (see crate docs)");
             return ExitCode::from(2);
         }
     };
@@ -120,6 +123,206 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
         out.weights_path.display()
     );
     Ok(())
+}
+
+/// `hearth up` — a whole fleet behind one OpenAI-compatible port.
+///
+/// This is the shape that replaces a model runner rather than supplementing
+/// one: declare a roster, hearth refuses what will not fit, brings up the rest,
+/// and answers on a single endpoint — routing by the `model` field the way
+/// every OpenAI client already sends it.
+///
+/// The part nothing else does is what happens when it CANNOT serve you. A
+/// model still loading is a 503 with Retry-After; a model whose GPU the host
+/// reclaimed is a 503 that says so in the body; a model that will never fit on
+/// this card is a 409, because a retryable status there is a router hammering a
+/// box that is arithmetically incapable of answering.
+fn cmd_up(args: &[String]) -> Result<(), String> {
+    let specs = collect_models(args)?;
+    if specs.is_empty() {
+        return Err(
+            "usage: hearth up --model NAME=/path/to.gguf[:GIB] [--model …] \
+                    [--port 11434] [--total-gib 48]"
+                .into(),
+        );
+    }
+    let api_port: u16 = flag(args, "--port")
+        .map(|v| v.parse().map_err(|e| format!("--port: {e}")))
+        .transpose()?
+        .unwrap_or(11434);
+    let total_gib: u64 = flag(args, "--total-gib")
+        .map(|v| v.parse().map_err(|e| format!("--total-gib: {e}")))
+        .transpose()?
+        .unwrap_or(24);
+    let ctx: u32 = flag(args, "--ctx")
+        .map(|v| v.parse().map_err(|e| format!("--ctx: {e}")))
+        .transpose()?
+        .unwrap_or(0);
+
+    let budget = Budget {
+        total_bytes: total_gib * GIB,
+        reserve_bytes: 2 * GIB,
+    };
+    // Declaration order IS priority order. The operator listed these in the
+    // order that matters to them; first fit, never best fit.
+    let declared: Vec<Declared> = specs
+        .iter()
+        .map(|(name, _, gib)| Declared {
+            model: name.clone(),
+            weights_bytes: gib * GIB,
+            kv_bytes: 0,
+        })
+        .collect();
+
+    install_signal_handlers();
+    let sup = Arc::new(Mutex::new(Supervisor::new(open_spine()?, budget, declared)));
+
+    // Start only what the budget admitted. Anything refused stays declared and
+    // visible — /residency reports it with the exact shortfall, rather than it
+    // silently not existing.
+    let log_dir = hearth_home().join("logs");
+    std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
+    for (name, gguf, _) in &specs {
+        let port = free_port()?;
+        let mut spec = ServerSpec::new(name, gguf, port);
+        spec.ctx = ctx;
+        spec.log_dir = log_dir.clone();
+        if let Some(b) = flag(args, "--binary") {
+            spec.binary = b.into();
+        }
+        if !runtime_available(&spec.binary) {
+            return Err(format!(
+                "runtime not available: {} — install llama.cpp or pass --binary",
+                spec.binary.display()
+            ));
+        }
+        match sup.lock().unwrap().start(spec) {
+            Ok(()) => eprintln!("hearth: {name} loading on 127.0.0.1:{port} …"),
+            // A refusal is not a crash. Say it and keep going: the rest of the
+            // fleet is still worth serving.
+            Err(e) => eprintln!("hearth: {name} not started — {e}"),
+        }
+    }
+
+    let addr = format!("127.0.0.1:{api_port}");
+    let server = hearth_api::Server::bind(&addr)?;
+    println!("hearth up on http://{addr}");
+    println!("  POST /v1/chat/completions   routed by the \"model\" field");
+    println!("  GET  /v1/models             what is declared, and what is ready");
+    println!("  GET  /residency             the truth the OpenAI shape cannot carry");
+
+    // The supervisor ticks on its own thread so a long generation never stalls
+    // residency tracking, and so the accept loop is never the thing holding
+    // the fleet lock.
+    let ticker = Arc::clone(&sup);
+    std::thread::spawn(move || {
+        while !SHUTDOWN.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(500));
+            let mut s = match ticker.lock() {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let n = s.tick();
+            if n > 0 {
+                eprintln!("hearth: {n} transition(s) recorded");
+                eprint!("{}", s.report());
+            }
+        }
+    });
+
+    for conn in server.incoming() {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            break;
+        }
+        let mut stream = match conn {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("hearth: accept failed: {e}");
+                continue;
+            }
+        };
+        let req = match hearth_api::http::read_request(&stream) {
+            Ok(r) => r,
+            Err(e) => {
+                let body = serde_json::json!({ "error": { "message": e } }).to_string();
+                let _ = stream
+                    .write_all(hearth_api::http::render_response(400, &body, None).as_bytes());
+                continue;
+            }
+        };
+
+        // Decide under the lock; act OUTSIDE it. A generation can take minutes,
+        // and holding the fleet lock across one would stall every other request
+        // and the supervisor with it.
+        let decision = {
+            let s = sup.lock().unwrap();
+            hearth_api::decide(&req.path, &req.body, s.fleet(), hearth_serve::now_ms())
+        };
+
+        match decision {
+            hearth_api::Decision::Proxy { model, endpoint } => {
+                if let Err(e) =
+                    hearth_api::http::proxy(&endpoint, &req, &mut stream, Duration::from_secs(5))
+                {
+                    // The fleet said ready and the socket disagreed. Report it
+                    // as a gateway failure rather than pretending the model
+                    // answered.
+                    eprintln!("hearth: proxy to {model} at {endpoint} failed: {e}");
+                    let body = serde_json::json!({
+                        "error": { "message": e, "type": "upstream_unreachable" }
+                    })
+                    .to_string();
+                    let _ = stream
+                        .write_all(hearth_api::http::render_response(502, &body, None).as_bytes());
+                }
+            }
+            hearth_api::Decision::Answer(r) => {
+                let _ = stream.write_all(
+                    hearth_api::http::render_response(r.status, &r.body, r.retry_after).as_bytes(),
+                );
+            }
+        }
+    }
+
+    eprintln!("hearth: shutting down — recording unloaded, reaping children");
+    sup.lock().unwrap().stop_all();
+    Ok(())
+}
+
+/// `--model NAME=/path/to.gguf` or `--model NAME=/path/to.gguf:20` (GiB).
+///
+/// The size is what the budget plans against. Without it we guess 4 GiB, which
+/// is deliberately conservative: over-guessing refuses models that would fit,
+/// and that is a worse failure than admitting one that is slightly tight.
+fn collect_models(args: &[String]) -> Result<Vec<(String, String, u64)>, String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--model" {
+            let spec = args
+                .get(i + 1)
+                .ok_or("--model needs NAME=/path/to.gguf[:GIB]")?;
+            let (name, rest) = spec
+                .split_once('=')
+                .ok_or_else(|| format!("--model {spec}: expected NAME=/path/to.gguf[:GIB]"))?;
+            // Split the size off the RIGHT, so a Windows path's drive colon is
+            // not mistaken for a size separator.
+            let (path, gib) = match rest.rsplit_once(':') {
+                Some((p, g)) if g.chars().all(|c| c.is_ascii_digit()) && !g.is_empty() => {
+                    (p, g.parse().unwrap_or(4))
+                }
+                _ => (rest, 4),
+            };
+            if name.is_empty() || path.is_empty() {
+                return Err(format!("--model {spec}: name and path are both required"));
+            }
+            out.push((name.to_string(), path.to_string(), gib));
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(out)
 }
 
 fn cmd_serve(args: &[String]) -> Result<(), String> {

@@ -77,6 +77,7 @@ Declare four 20 GiB models on a 48 GiB card and no runtime errors. It loads, evi
 | [`hearth-store`](crates/hearth-store/README.md) | [crates.io](https://crates.io/crates/hearth-store) | the NEDB spine |
 | [`hearth-resolve`](crates/hearth-resolve/README.md) | [crates.io](https://crates.io/crates/hearth-resolve) | Ollama + HuggingFace resolution |
 | [`hearth-pull`](crates/hearth-pull/README.md) | [crates.io](https://crates.io/crates/hearth-pull) | fetch weights, digest-verified and recorded |
+| [`hearth-api`](crates/hearth-api/README.md) | [crates.io](https://crates.io/crates/hearth-api) | one OpenAI-compatible port in front of the fleet |
 | [`@interchained/hearth`](crates/hearth-node/README.md) | [npm](https://www.npmjs.com/package/@interchained/hearth) | Node bindings, prebuilt for 4 platforms |
 | [`hearth-engine`](crates/hearth-py/README.md) | [PyPI](https://pypi.org/project/hearth-engine/) | Python bindings, one abi3 wheel per platform |
 
@@ -88,6 +89,7 @@ Each package page is written for the language you land in — the API is the sam
 `hearth-resolve` — one reference syntax over the Ollama registry and HuggingFace GGUFs, verified against the live registries. **Resolution only: it plans blob URLs and byte counts, and fetches nothing** — `serde` and `serde_json` are its entire dependency list.
 `hearth-store` — **the NEDB spine.** Every residency transition is a bi-temporal, causally-linked, tamper-evident event in an embedded [NEDB](https://github.com/Eth-Interchained/nedb). Not a log on the side: the supervisor's memory IS the database.
 `hearth-pull` — the downloader. Digest-verified, resumable, and every fetch recorded in the spine with its origin. Real: 637 MB from `registry.ollama.ai` in 33s, and a 64-byte corruption at offset 300M — same file size — caught by re-hashing and healed.
+`hearth-api` — the gateway. One OpenAI-compatible port routing by the `model` field, where the HTTP status carries the diagnosis: warming is a 503 with Retry-After, a reclaimed GPU is a 503 saying it was not the operator's doing, and a model that will never fit is a **409** — because a retryable status there is a router hammering a box that is arithmetically incapable of answering.
 `hearth-serve` — the supervisor. `llama-server` children, honest health probes, `gpu_present` via nvidia-smi (an honest `None` on CPU boxes), SIGTERM records `unloaded` and reaps children. Plus the `hearth` CLI.
 
 Proven end-to-end on a real model: `hearth serve` brought a GGUF resident under a real `llama-server` (warmup measured, not guessed), served real completion tokens, took a SIGTERM, and a **fresh process** then read the whole story back off disk:
@@ -108,7 +110,7 @@ verify ok — 4 nodes checked, history intact
 
 *What was resident **as of** seq 2* is a real query against a real causal chain. When a model goes cold at 3am you get the answer instead of a theory — and `verify` proves nobody rewrote it. No other serving stack can print that.
 
-Next: HuggingFace fetch (resolve already plans it) · HTTP surface (OpenAI-compatible proxy + `/residency`) · multi-model fleets under one supervisor · napi + PyO3 bindings for store/serve.
+Next: HuggingFace fetch (resolve already plans it) · streaming verified against a real llama-server · napi + PyO3 bindings for store/serve/api.
 
 ## Integration
 

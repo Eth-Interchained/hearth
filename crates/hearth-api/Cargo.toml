@@ -1,0 +1,17 @@
+[package]
+name = "hearth-api"
+description = "An OpenAI-compatible port in front of a hearth fleet, where the HTTP status carries the diagnosis."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["llm", "openai", "proxy", "gateway", "inference"]
+categories = ["network-programming", "web-programming::http-server"]
+documentation = "https://docs.rs/hearth-api"
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+hearth-core = { path = "../hearth-core", version = "0.3.5" }
+serde_json = { workspace = true }
