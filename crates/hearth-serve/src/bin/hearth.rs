@@ -57,6 +57,7 @@ fn main() -> ExitCode {
         Some("pull") => cmd_pull(&args[1..]),
         Some("up") => cmd_up(&args[1..]),
         Some("preload") => cmd_preload(&args[1..]),
+        Some("runtime") => cmd_runtime(&args[1..]),
         _ => {
             eprintln!(
                 "usage: hearth up|preload|pull|serve|status|why|as-of|verify (see crate docs)"
@@ -285,6 +286,225 @@ fn fetch_local_json(port: u16, path: &str) -> Result<String, String> {
         .ok_or_else(|| "no body in the gateway's answer".into())
 }
 
+/// `hearth runtime` — fetch a prebuilt llama-server. No compiler, no CUDA
+/// toolkit, no prerequisite beyond curl and tar.
+///
+/// Preference on Linux+NVIDIA: hearth's OWN CI-built CUDA binary (upstream
+/// ships none for Linux), falling back to upstream's Vulkan build — which
+/// rides the driver's own ICD. Everything else gets upstream's native build.
+/// The llama-server this box should use, and a clear error when none exists.
+/// Order: HEARTH_LLAMA_SERVER > PATH > the runtime `hearth runtime` fetched.
+fn default_binary() -> Result<std::path::PathBuf, String> {
+    use hearth_pull::runtime as rt;
+    let on_path = std::process::Command::new("llama-server")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    match rt::resolve_server(&hearth_home(), on_path) {
+        rt::Resolved::Explicit(p) => Ok(p),
+        rt::Resolved::OnPath => Ok("llama-server".into()),
+        rt::Resolved::Fetched(p) => Ok(p),
+        rt::Resolved::Missing => Err(
+            "no llama-server found. Run `hearth runtime` to fetch a prebuilt one \
+             (no compiler needed), or install llama.cpp yourself and put \
+             llama-server on PATH."
+                .into(),
+        ),
+    }
+}
+
+fn cmd_runtime(args: &[String]) -> Result<(), String> {
+    use hearth_pull::runtime as rt;
+
+    let plat = rt::Platform::detect();
+    let home = hearth_home();
+    let dir = rt::runtime_dir(&home);
+    let bin_dir = dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
+
+    let force = args.iter().any(|a| a == "--force");
+    if let Some(existing) = rt::fetched_server(&home) {
+        if !force {
+            println!("runtime already fetched at {}", existing.display());
+            println!("  (re-fetch with: hearth runtime --force)");
+            return Ok(());
+        }
+    }
+
+    // 1. hearth's own CUDA build, when this box can use one.
+    let mut fetched_from = String::new();
+    let mut archive = dir.join("runtime.tar.gz");
+    if let Some(cuda_url) = rt::hearth_cuda_asset(plat) {
+        eprintln!(
+            "hearth: trying the CUDA build (built by hearth CI — upstream ships none for linux)…"
+        );
+        let req = hearth_pull::curl::Request::get(&cuda_url).to_file(&archive);
+        match hearth_pull::curl::fetch_file(&req, true) {
+            Ok(_) => fetched_from = cuda_url,
+            Err(e) => {
+                eprintln!("hearth: no CUDA build available yet ({})", first_line(&e.0));
+                eprintln!(
+                    "hearth: falling back to upstream Vulkan — zero compile, runs on your driver"
+                );
+            }
+        }
+    }
+
+    // 2. Upstream's best zero-compile build for this platform.
+    if fetched_from.is_empty() {
+        let tag = latest_llama_tag()?;
+        let asset = rt::asset_pattern(plat).replace("{tag}", &tag);
+        let url = format!("https://github.com/ggml-org/llama.cpp/releases/download/{tag}/{asset}");
+        eprintln!("hearth: fetching {asset} …");
+        archive = dir.join(&asset);
+        let req = hearth_pull::curl::Request::get(&url).to_file(&archive);
+        hearth_pull::curl::fetch_file(&req, true).map_err(|e| e.0)?;
+        fetched_from = url;
+    }
+
+    // 3. Extract. tar is on every box that made it this far.
+    let out = std::process::Command::new("tar")
+        .args([
+            "-xzf",
+            &archive.display().to_string(),
+            "-C",
+            &dir.display().to_string(),
+        ])
+        .output()
+        .map_err(|e| format!("could not run tar: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "extracting {}: {}",
+            archive.display(),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+
+    // 4. Normalize: whatever layout the tarball used, the server and its
+    //    shared libraries end up in runtime/bin. FOUND, not guessed — the
+    //    first attempt hardcoded build/bin and bin, and the real b10673
+    //    tarball unpacks to llama-<tag>/ with everything flat inside it.
+    let found = find_file(&dir, "llama-server", 3).ok_or_else(|| {
+        format!(
+            "the archive did not contain llama-server anywhere under {}",
+            dir.display()
+        )
+    })?;
+    let src = found.parent().unwrap_or(&dir).to_path_buf();
+    let mut moved = 0usize;
+    if src != bin_dir {
+        for entry in std::fs::read_dir(&src).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entry.path().is_dir() {
+                continue;
+            }
+            let to = bin_dir.join(entry.file_name());
+            if std::fs::rename(entry.path(), &to).is_ok() {
+                moved += 1;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&src);
+    }
+    let server = bin_dir.join("llama-server");
+    if !server.exists() {
+        return Err(format!(
+            "the archive did not contain llama-server where expected — look in {}",
+            dir.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755));
+    }
+    let _ = std::fs::remove_file(&archive);
+
+    // 5. Smoke it. A binary that cannot even print its version must not be
+    //    reported as an installed runtime.
+    let ver = std::process::Command::new(&server)
+        .arg("--version")
+        .env("LD_LIBRARY_PATH", &bin_dir)
+        .output();
+    match ver {
+        Ok(o) if o.status.success() || !o.stderr.is_empty() => {
+            let v = String::from_utf8_lossy(if o.stdout.is_empty() {
+                &o.stderr
+            } else {
+                &o.stdout
+            });
+            println!("runtime ready: {}", server.display());
+            println!("  {}", first_line(v.trim()));
+            println!("  from {fetched_from}  ({moved} file(s))");
+        }
+        Ok(o) => {
+            return Err(format!(
+                "fetched, but llama-server --version failed (exit {:?}) — a missing \
+                 system library is the usual cause; run it by hand to see which: \
+                 LD_LIBRARY_PATH={} {} --version",
+                o.status.code(),
+                bin_dir.display(),
+                server.display()
+            ));
+        }
+        Err(e) => return Err(format!("fetched, but could not run it: {e}")),
+    }
+    if let Some(note) = rt::tradeoff_note(plat) {
+        if !fetched_from.contains("runtime-cuda") {
+            println!("  note: {note}");
+        }
+    }
+    println!("  `hearth up` and `hearth serve` will use it automatically.");
+    Ok(())
+}
+
+/// Breadth-limited search for a file by name. Depth-capped so a hostile or
+/// malformed archive cannot walk us anywhere expensive.
+fn find_file(root: &std::path::Path, name: &str, depth: u8) -> Option<std::path::PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut dirs = Vec::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_file() && e.file_name() == name {
+            return Some(p);
+        }
+        if p.is_dir() {
+            dirs.push(p);
+        }
+    }
+    dirs.into_iter()
+        .find_map(|d| find_file(&d, name, depth - 1))
+}
+
+fn first_line(s: &str) -> &str {
+    s.lines().next().unwrap_or(s)
+}
+
+/// The newest llama.cpp release tag, from the GitHub API via curl.
+fn latest_llama_tag() -> Result<String, String> {
+    let body = hearth_pull::curl::fetch_string(
+        &hearth_pull::curl::Request::get(
+            "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=1",
+        )
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "hearth"),
+    )
+    .map_err(|e| e.0)?;
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("release listing was not json: {e}"))?;
+    v.get(0)
+        .and_then(|r| r.get("tag_name"))
+        .and_then(|t| t.as_str())
+        .map(String::from)
+        .ok_or_else(|| "no releases in the listing".into())
+}
+
 fn cmd_pull(args: &[String]) -> Result<(), String> {
     let reference = args
         .iter()
@@ -401,6 +621,10 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
         spec.parallel = parallel;
         spec.gpu_layers = gpu_layers;
         spec.mlock = mlock;
+        spec.binary = match flag(args, "--binary") {
+            Some(b) => b.into(),
+            None => default_binary()?,
+        };
         spec.log_dir = log_dir.clone();
         if let Some(b) = flag(args, "--binary") {
             spec.binary = b.into();
@@ -716,9 +940,10 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
 
     let mut spec = ServerSpec::new(&model, &gguf, port);
     spec.ctx = ctx;
-    if let Some(b) = flag(args, "--binary") {
-        spec.binary = b.into();
-    }
+    spec.binary = match flag(args, "--binary") {
+        Some(b) => b.into(),
+        None => default_binary()?,
+    };
     spec.log_dir = hearth_home().join("logs");
     std::fs::create_dir_all(&spec.log_dir).map_err(|e| e.to_string())?;
 

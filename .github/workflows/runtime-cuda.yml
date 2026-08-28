@@ -1,0 +1,92 @@
+# Build the Linux CUDA llama-server that upstream does not ship.
+#
+# llama.cpp publishes prebuilt CUDA binaries for Windows but not Linux —
+# checked against the live b10673 release listing, not assumed. A stock
+# GitHub runner can still BUILD one: compiling CUDA needs the toolkit, not a
+# GPU. The asset lands on the fixed `runtime-cuda` release, where
+# `hearth runtime` prefers it on Linux+NVIDIA and falls back to upstream's
+# Vulkan build when it is absent — so this workflow failing never strands an
+# operator, it just leaves them on the slower-but-working path.
+#
+# Monthly, because llama.cpp moves fast enough that a stale runtime slowly
+# drifts behind model-format changes — and on demand, for when we want a fix
+# that just landed upstream.
+
+name: runtime-cuda
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 1 * *" # monthly, the 1st at 06:00 UTC
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install CUDA toolkit (no GPU needed to compile)
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.4.1"
+          method: network
+          # Just the compiler and libraries — the full local installer is 4GB+
+          # of things a build never touches.
+          sub-packages: '["nvcc", "cudart-dev", "cublas-dev", "toolkit"]'
+
+      - name: fetch the latest llama.cpp release source
+        id: llama
+        run: |
+          TAG=$(curl -s -H "User-Agent: hearth-ci" \
+            "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=1" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['tag_name'])")
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          git clone --depth 1 --branch "$TAG" \
+            https://github.com/ggml-org/llama.cpp llama.cpp
+
+      - name: build llama-server with CUDA
+        run: |
+          cd llama.cpp
+          # Real architectures, not "native" — the runner has no GPU to probe.
+          # 86 is the A6000; 80/89/90 cover A100, 4090/L4, and H100 class so
+          # one asset serves the cards this project will actually meet.
+          cmake -B build \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_CURL=OFF
+          cmake --build build --config Release -j "$(nproc)" -t llama-server
+
+      - name: package
+        run: |
+          mkdir -p out
+          # The server plus every shared library it was built against —
+          # shipping the binary alone produces "started, then died" on every
+          # box whose system libs differ.
+          cp llama.cpp/build/bin/llama-server out/
+          find llama.cpp/build -name '*.so*' -exec cp {} out/ \;
+          echo "${{ steps.llama.outputs.tag }}" > out/LLAMA_TAG
+          tar -czf llama-server-cuda-linux-x64.tar.gz -C out .
+          ls -lh llama-server-cuda-linux-x64.tar.gz
+
+      - name: publish to the fixed runtime-cuda release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A fixed tag, so `hearth runtime` has one stable URL. The release is
+          # recreated rather than appended to — the asset name is the contract,
+          # and two assets with one name is how a downloader gets a coin flip.
+          gh release delete runtime-cuda --yes 2>/dev/null || true
+          git push origin :refs/tags/runtime-cuda 2>/dev/null || true
+          gh release create runtime-cuda \
+            --title "runtime-cuda (llama.cpp ${{ steps.llama.outputs.tag }})" \
+            --notes "Linux x64 CUDA build of llama-server — the prebuilt upstream does not ship. \
+          Built monthly from the latest llama.cpp release on a stock runner (compiling CUDA \
+          needs the toolkit, not a GPU). Fetched automatically by \`hearth runtime\` on \
+          Linux+NVIDIA; Vulkan remains the fallback when this asset is unavailable. \
+          Architectures: 80;86;89;90 (A100 / A6000 / 4090+L4 / H100)." \
+            llama-server-cuda-linux-x64.tar.gz
