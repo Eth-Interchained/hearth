@@ -195,6 +195,34 @@ impl Spine {
         self.db.get(RESIDENCY, model).as_ref().and_then(Event::of)
     }
 
+    /// The latest pull event for `model`, if it was ever fetched.
+    ///
+    /// Separate from `latest` on purpose: a pull is not a residency state, and
+    /// letting one answer "is this model warm" would conflate having the bytes
+    /// with having them loaded. But the events were previously written to their
+    /// own collection and read by nothing, so `hearth why` reported "no history
+    /// in the spine" for a model it had just downloaded and verified — a false
+    /// statement, which is worse than an empty one.
+    pub fn latest_pull(&self, model: &str) -> Option<Event> {
+        self.db.get(PULLS, model).as_ref().and_then(Event::of)
+    }
+
+    /// Where the bytes came from, newest first: the pull chain.
+    ///
+    /// `PullCompleted` cites `PullStarted` as its cause, so this walks the same
+    /// causal links `why` does — "where did this file come from" is a query
+    /// against a verifiable chain rather than an archaeology project.
+    pub fn provenance(&self, model: &str) -> Vec<Event> {
+        let Some(latest) = self.latest_pull(model) else {
+            return Vec::new();
+        };
+        self.db
+            .trace(&latest.hash, false, 64)
+            .iter()
+            .filter_map(Event::of)
+            .collect()
+    }
+
     /// What the model's state was at sequence `seq`. Time travel.
     pub fn state_as_of(&self, model: &str, seq: u64) -> Option<Event> {
         self.db
@@ -543,5 +571,73 @@ mod tests {
         let (checked, failures) = s.verify();
         assert!(checked >= 3);
         assert!(failures.is_empty());
+    }
+    // -- pull provenance ---------------------------------------------------
+    //
+    // Pull events are written to their own collection, and for one commit they
+    // were read by nothing — so `hearth why` reported "no history in the spine"
+    // about a model it had just downloaded and digest-verified. Recorded but
+    // unreachable is not recorded.
+
+    #[test]
+    fn a_pull_is_reachable_after_it_is_recorded() {
+        let s = Spine::in_memory();
+        let started = s
+            .record(
+                "tinyllama:latest",
+                &Transition::PullStarted {
+                    source: "ollama:library/tinyllama:latest".into(),
+                },
+                &[],
+            )
+            .unwrap();
+        s.record(
+            "tinyllama:latest",
+            &Transition::PullCompleted {
+                path: "/b/sha256-2af3".into(),
+                size_bytes: 637_699_456,
+            },
+            &[started],
+        )
+        .unwrap();
+
+        let chain = s.provenance("tinyllama:latest");
+        assert_eq!(chain.len(), 2, "completed <- started: {chain:?}");
+        assert_eq!(chain[0].kind, "pull_completed");
+        assert_eq!(chain[1].kind, "pull_started");
+        assert_eq!(
+            chain[1].facts["source"],
+            serde_json::json!("ollama:library/tinyllama:latest"),
+            "the origin is the entire point of recording it"
+        );
+        assert_eq!(
+            chain[0].facts["size_bytes"],
+            serde_json::json!(637_699_456u64)
+        );
+    }
+
+    #[test]
+    fn a_pull_is_not_a_residency_state() {
+        // Having the bytes is not having them loaded. If a pull answered
+        // `latest`, a downloaded-but-never-served model would read as resident.
+        let s = Spine::in_memory();
+        s.record(
+            "m",
+            &Transition::PullCompleted {
+                path: "/b/x".into(),
+                size_bytes: 1,
+            },
+            &[],
+        )
+        .unwrap();
+        assert!(s.latest("m").is_none(), "not a residency event");
+        assert!(s.why("m").is_empty());
+        assert!(s.latest_pull("m").is_some(), "but it IS a pull event");
+    }
+
+    #[test]
+    fn provenance_of_something_never_pulled_is_empty_not_a_panic() {
+        let s = Spine::in_memory();
+        assert!(s.provenance("never-heard-of-it").is_empty());
     }
 }

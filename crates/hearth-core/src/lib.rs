@@ -23,6 +23,7 @@
 pub mod budget;
 pub mod fleet;
 pub mod residency;
+pub mod sha256;
 
 pub use budget::{plan, Budget, Declared, Plan, Rejection, GIB};
 pub use fleet::{Fleet, Route, Slot};

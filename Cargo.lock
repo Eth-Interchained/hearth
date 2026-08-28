@@ -421,6 +421,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hearth-pull"
+version = "0.3.3"
+dependencies = [
+ "hearth-core",
+ "hearth-resolve",
+ "hearth-store",
+ "serde_json",
+]
+
+[[package]]
 name = "hearth-py"
 version = "0.3.3"
 dependencies = [
@@ -442,6 +452,7 @@ name = "hearth-serve"
 version = "0.3.3"
 dependencies = [
  "hearth-core",
+ "hearth-pull",
  "hearth-store",
  "serde",
  "serde_json",
