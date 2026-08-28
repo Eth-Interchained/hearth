@@ -9,7 +9,7 @@
 //! three languages describing one state machine will drift, and the way you
 //! prevent it is by having only one of them contain rules.
 
-use hearth_core::budget::{plan as core_plan, Budget, Declared};
+use hearth_core::budget::{declared_from_json, plan as core_plan, Budget, Declared};
 use hearth_core::fleet::Fleet;
 use hearth_core::residency::{Millis, Observation};
 use pyo3::exceptions::PyValueError;
@@ -20,20 +20,13 @@ fn parse(s: &str) -> PyResult<Value> {
     serde_json::from_str(s).map_err(|e| PyValueError::new_err(format!("bad json: {e}")))
 }
 
-fn roster_from(v: &Value) -> Vec<Declared> {
-    v.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|d| {
-                    Some(Declared {
-                        model: d.get("model")?.as_str()?.to_string(),
-                        weights_bytes: d.get("weights_bytes")?.as_u64()?,
-                        kv_bytes: d.get("kv_bytes").and_then(|k| k.as_u64()).unwrap_or(0),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// Parse a roster, or raise. The core owns the rules; this only turns a
+/// failure into a Python exception. Never skips an entry it could not read —
+/// a roster that silently shrinks produces a plan about the wrong question.
+fn roster_from(v: &Value) -> PyResult<Vec<Declared>> {
+    declared_from_json(v).map_err(|errs| {
+        PyValueError::new_err(format!("could not read the roster: {}", errs.join("; ")))
+    })
 }
 
 /// Can this card hold this roster? Returns a JSON string.
@@ -41,7 +34,8 @@ fn roster_from(v: &Value) -> Vec<Declared> {
 #[pyo3(signature = (total_bytes, reserve_pct, declared_json))]
 fn plan(total_bytes: u64, reserve_pct: u8, declared_json: &str) -> PyResult<String> {
     let budget = Budget::with_reserve_pct(total_bytes, reserve_pct.min(100));
-    let p = core_plan(budget, &roster_from(&parse(declared_json)?));
+    let roster = roster_from(&parse(declared_json)?)?;
+    let p = core_plan(budget, &roster);
     Ok(json!({
         "fits": p.fits(),
         "admitted": p.admitted,
@@ -55,6 +49,7 @@ fn plan(total_bytes: u64, reserve_pct: u8, declared_json: &str) -> PyResult<Stri
         "usable_bytes": p.usable_bytes,
         "headroom_bytes": p.headroom_bytes(),
         "explain": p.explain(),
+        "declared": roster.len(),
     })
     .to_string())
 }
@@ -71,7 +66,7 @@ impl PyFleet {
     fn new(total_bytes: u64, reserve_pct: u8, declared_json: &str) -> PyResult<Self> {
         let budget = Budget::with_reserve_pct(total_bytes, reserve_pct.min(100));
         Ok(PyFleet {
-            inner: Fleet::declare(budget, roster_from(&parse(declared_json)?)),
+            inner: Fleet::declare(budget, roster_from(&parse(declared_json)?)?),
         })
     }
 

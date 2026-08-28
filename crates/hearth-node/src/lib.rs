@@ -10,40 +10,38 @@
 //! same state machine will drift, and JSON is the one shape all three already
 //! agree on.
 
-use hearth_core::budget::{plan as core_plan, Budget, Declared};
+use hearth_core::budget::{declared_from_json, plan as core_plan, Budget};
 use hearth_core::fleet::Fleet;
 use hearth_core::residency::{Millis, Observation};
 use napi_derive::napi;
 use serde_json::{json, Value};
 
-fn declared_from(v: &Value) -> Option<Declared> {
-    Some(Declared {
-        model: v.get("model")?.as_str()?.to_string(),
-        weights_bytes: v
-            .get("weightsBytes")
-            .or_else(|| v.get("weights_bytes"))?
-            .as_u64()?,
-        kv_bytes: v
-            .get("kvBytes")
-            .or_else(|| v.get("kv_bytes"))
-            .and_then(|k| k.as_u64())
-            .unwrap_or(0),
+/// Parse a roster, or throw. The core owns the rules; this only turns a
+/// failure into a JS exception.
+///
+/// It used to be a `filter_map` that returned whatever survived, which meant a
+/// roster of three could quietly become a roster of zero — and zero models
+/// trivially fit, so the answer was `fits: true`. Loud beats convenient.
+fn roster_from(v: &Value) -> napi::Result<Vec<hearth_core::budget::Declared>> {
+    declared_from_json(v).map_err(|errs| {
+        napi::Error::from_reason(format!(
+            "could not read the roster:
+  {}",
+            errs.join(
+                "
+  "
+            )
+        ))
     })
-}
-
-fn roster_from(v: &Value) -> Vec<Declared> {
-    v.as_array()
-        .map(|a| a.iter().filter_map(declared_from).collect())
-        .unwrap_or_default()
 }
 
 /// Can this card hold this roster? Answers before anything loads.
 #[napi]
-pub fn plan(total_bytes: i64, reserve_pct: u32, declared: Value) -> Value {
+pub fn plan(total_bytes: i64, reserve_pct: u32, declared: Value) -> napi::Result<Value> {
     let budget = Budget::with_reserve_pct(total_bytes.max(0) as u64, reserve_pct.min(100) as u8);
-    let roster = roster_from(&declared);
+    let roster = roster_from(&declared)?;
     let p = core_plan(budget, &roster);
-    json!({
+    Ok(json!({
         "fits": p.fits(),
         "admitted": p.admitted,
         "rejected": p.rejected.iter().map(|r| json!({
@@ -56,7 +54,11 @@ pub fn plan(total_bytes: i64, reserve_pct: u32, declared: Value) -> Value {
         "usableBytes": p.usable_bytes,
         "headroomBytes": p.headroom_bytes(),
         "explain": p.explain(),
-    })
+        // The count the caller declared, echoed back. If you sent three models
+        // and this says three, the plan is about your roster and not a
+        // silently emptied one.
+        "declared": roster.len(),
+    }))
 }
 
 /// A live fleet. Declare once, feed observations, ask for routes.
@@ -68,12 +70,12 @@ pub struct HearthFleet {
 #[napi]
 impl HearthFleet {
     #[napi(constructor)]
-    pub fn new(total_bytes: i64, reserve_pct: u32, declared: Value) -> Self {
+    pub fn new(total_bytes: i64, reserve_pct: u32, declared: Value) -> napi::Result<Self> {
         let budget =
             Budget::with_reserve_pct(total_bytes.max(0) as u64, reserve_pct.min(100) as u8);
-        HearthFleet {
-            inner: Fleet::declare(budget, roster_from(&declared)),
-        }
+        Ok(HearthFleet {
+            inner: Fleet::declare(budget, roster_from(&declared)?),
+        })
     }
 
     #[napi]

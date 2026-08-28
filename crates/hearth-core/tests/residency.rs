@@ -380,3 +380,89 @@ fn a_tiny_card_still_gets_a_real_reserve() {
     let small = Budget::with_reserve_pct(4 * GIB, 8);
     assert!(small.reserve_bytes >= GIB);
 }
+
+// ---------------------------------------------------------------------------
+// Reading a roster out of JSON.
+//
+// These exist because the Node binding shipped a version that dropped every
+// model on the floor and then reported `fits: true`. JavaScript has no
+// integers, every size arrived as an f64, `as_u64()` said None to all of them,
+// and a `filter_map` quietly discarded the entire roster. An empty roster
+// trivially fits — so the answer was confident, instant, and about a question
+// nobody asked.
+//
+// Caught by running the addon, not by reading it.
+// ---------------------------------------------------------------------------
+
+use hearth_core::budget::declared_from_json;
+use serde_json::json;
+
+#[test]
+fn a_javascript_number_is_a_valid_byte_count() {
+    // THE BUG. JS sends 21474836480 as an f64 and there is nothing wrong with
+    // that — a language without integers is not making a mistake.
+    let v = json!([{ "model": "muse", "weightsBytes": 21474836480.0_f64, "kvBytes": 1.0e9 }]);
+    let got = declared_from_json(&v).expect("an f64 byte count must be accepted");
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].weights_bytes, 21474836480);
+    assert_eq!(got[0].kv_bytes, 1_000_000_000);
+}
+
+#[test]
+fn a_roster_never_ever_silently_shrinks() {
+    // The real sin was not the f64 — it was skipping what could not be read.
+    // A plan computed over a roster that quietly lost half its entries is
+    // right about the wrong question, which is worse than an error.
+    let v = json!([
+        { "model": "good", "weightsBytes": 1000 },
+        { "model": "bad" },
+        { "weightsBytes": 1000 },
+    ]);
+    let errs = declared_from_json(&v).expect_err("must refuse, not shrink");
+    assert_eq!(errs.len(), 2, "every unreadable entry is named: {errs:?}");
+    assert!(errs.iter().any(|e| e.contains("bad")), "{errs:?}");
+    assert!(errs.iter().any(|e| e.contains("model")), "{errs:?}");
+}
+
+#[test]
+fn both_spellings_work_because_two_languages_call_it_two_things() {
+    let camel = json!([{ "model": "m", "weightsBytes": 10, "kvBytes": 5 }]);
+    let snake = json!([{ "model": "m", "weights_bytes": 10, "kv_bytes": 5 }]);
+    assert_eq!(
+        declared_from_json(&camel).unwrap(),
+        declared_from_json(&snake).unwrap()
+    );
+}
+
+#[test]
+fn kv_is_optional_but_a_malformed_kv_is_not_ignored() {
+    let absent = json!([{ "model": "m", "weightsBytes": 10 }]);
+    assert_eq!(declared_from_json(&absent).unwrap()[0].kv_bytes, 0);
+
+    let null = json!([{ "model": "m", "weightsBytes": 10, "kvBytes": null }]);
+    assert_eq!(declared_from_json(&null).unwrap()[0].kv_bytes, 0);
+
+    // Present and wrong is a different thing from absent, and must be said.
+    let junk = json!([{ "model": "m", "weightsBytes": 10, "kvBytes": "lots" }]);
+    assert!(declared_from_json(&junk).is_err());
+}
+
+#[test]
+fn a_fractional_or_negative_size_is_a_bug_worth_surfacing() {
+    // Truncating 1.5 bytes would be inventing data; clamping -1 would be
+    // hiding a caller's arithmetic error.
+    assert!(declared_from_json(&json!([{ "model": "m", "weightsBytes": 1.5 }])).is_err());
+    assert!(declared_from_json(&json!([{ "model": "m", "weightsBytes": -1 }])).is_err());
+}
+
+#[test]
+fn an_empty_model_name_is_refused() {
+    // It would produce a slot nothing can ever route to.
+    assert!(declared_from_json(&json!([{ "model": "", "weightsBytes": 10 }])).is_err());
+}
+
+#[test]
+fn a_genuinely_empty_roster_is_fine_but_a_non_array_is_not() {
+    assert_eq!(declared_from_json(&json!([])).unwrap().len(), 0);
+    assert!(declared_from_json(&json!({ "model": "m" })).is_err());
+}

@@ -13,5 +13,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 hearth-core = { path = "../hearth-core", version = "0.1.0" }
-pyo3 = { version = "0.22", features = ["extension-module"] }
+# abi3-py39: ONE wheel per platform covers every Python from 3.9 up, instead
+# of a separate build per minor version. Fewer artifacts, and a user on a
+# Python we never built for still gets a binary instead of a compiler error.
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
 serde_json = { workspace = true }

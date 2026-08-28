@@ -168,3 +168,83 @@ pub fn plan(budget: Budget, declared: &[Declared]) -> Plan {
         usable_bytes: usable,
     }
 }
+
+/// Read a declared roster out of JSON.
+///
+/// This lives in the core, not in the bindings, because parsing is a RULE and
+/// rules belong where they can be tested. It got moved here after the Node
+/// binding silently dropped an entire roster and then cheerfully reported
+/// `fits: true` — JavaScript has no integers, so every size arrived as an f64
+/// and `as_u64()` returned None for all of them. A `filter_map` swallowed the
+/// lot. An empty roster trivially fits, so the answer was confident, instant
+/// and completely wrong.
+///
+/// Two rules came out of that, and both are load-bearing:
+///
+///   1. Accept a float that is exactly an integer. A caller in a language
+///      without integers is not making a mistake by sending 2.147e10.
+///   2. NEVER skip an entry you could not read. Every failure is named and
+///      returned, because a roster that silently shrinks produces a plan that
+///      is right about the wrong question.
+pub fn declared_from_json(v: &serde_json::Value) -> Result<Vec<Declared>, Vec<String>> {
+    let Some(items) = v.as_array() else {
+        return Err(vec!["expected an array of declared models".into()]);
+    };
+
+    let mut out = Vec::with_capacity(items.len());
+    let mut errors = Vec::new();
+
+    for (i, item) in items.iter().enumerate() {
+        match one_declared(item) {
+            Ok(d) => out.push(d),
+            Err(why) => errors.push(format!("entry {i}: {why}")),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(out)
+    } else {
+        Err(errors)
+    }
+}
+
+/// A size in bytes, from either an integer or an integer-valued float.
+fn size_of(v: Option<&serde_json::Value>) -> Option<u64> {
+    let v = v?;
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    // JS numbers are f64. Accept one only when it is genuinely a whole
+    // non-negative count — silently truncating 1.5 bytes would be inventing
+    // data, and a negative size is a bug worth surfacing rather than clamping.
+    let f = v.as_f64()?;
+    if f.is_finite() && f >= 0.0 && f.fract() == 0.0 {
+        Some(f as u64)
+    } else {
+        None
+    }
+}
+
+fn one_declared(v: &serde_json::Value) -> Result<Declared, String> {
+    let model = v
+        .get("model")
+        .and_then(|m| m.as_str())
+        .ok_or("missing \"model\"")?;
+    if model.is_empty() {
+        return Err("\"model\" is empty".into());
+    }
+    // Both spellings, because the same core serves a camelCase language and a
+    // snake_case one and neither should have to translate.
+    let weights = size_of(v.get("weightsBytes").or_else(|| v.get("weights_bytes")))
+        .ok_or_else(|| format!("{model}: \"weightsBytes\" missing or not a whole byte count"))?;
+    let kv = match v.get("kvBytes").or_else(|| v.get("kv_bytes")) {
+        None | Some(serde_json::Value::Null) => 0,
+        some => size_of(some)
+            .ok_or_else(|| format!("{model}: \"kvBytes\" is not a whole byte count"))?,
+    };
+    Ok(Declared {
+        model: model.to_string(),
+        weights_bytes: weights,
+        kv_bytes: kv,
+    })
+}
