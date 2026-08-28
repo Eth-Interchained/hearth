@@ -238,6 +238,23 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
 
     let addr = format!("127.0.0.1:{api_port}");
     let server = hearth_api::Server::bind(&addr)?;
+
+    // SIGTERM latches SHUTDOWN, but the accept loop below is BLOCKED inside
+    // accept(2), which only returns when a connection arrives — so a TERM was
+    // ignored until the next request happened to come in, and every clean stop
+    // ended in somebody's kill -9, which loses the final unloaded events from
+    // the spine. This watcher unblocks accept the moment the latch flips, by
+    // connecting to our own port once. Found by `start.sh down` timing out at
+    // 10 seconds of TERM on a healthy gateway.
+    {
+        let addr = addr.clone();
+        std::thread::spawn(move || {
+            while !SHUTDOWN.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            let _ = std::net::TcpStream::connect(&addr);
+        });
+    }
     println!("hearth up on http://{addr}");
     // Print what was actually chosen. A server whose concurrency you have to
     // infer from a config file is a server nobody tunes.

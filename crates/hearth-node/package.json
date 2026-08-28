@@ -1,6 +1,6 @@
 {
   "name": "@interchained/hearth",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Deterministic model residency \u2014 keep declared models warm, and tell the truth about which ones are.",
   "license": "BUSL-1.1",
   "repository": {
