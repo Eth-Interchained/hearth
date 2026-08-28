@@ -16,12 +16,22 @@
 //! hf:TheBloke/Llama-2-7B-GGUF        huggingface, quant chosen for you
 //! hf:TheBloke/Llama-2-7B-GGUF@Q5_K_M huggingface, quant pinned
 //! hf:owner/repo@Q4_K_M#refs/pr/3     ...at a specific revision
+//! https://example.com/model.gguf     a direct download, self-verified
+//! https://example.com/m.gguf#sha256:ab12…   ...with a digest pinned
 //! ./models/muse.gguf                 a file you already have
 //! ```
 //!
 //! A bare name means Ollama on purpose. It is what people already type, and a
 //! tool that punishes existing muscle memory to make a point about neutrality
 //! is a tool nobody switches to.
+//!
+//! A bare URL is the odd one out: neither registry publishes a digest for it,
+//! so there is nothing to verify against ahead of the download. hearth still
+//! refuses to trust it blindly — see [`hearth_pull`]'s self-computed digest —
+//! but `hearth why` on a URL pull says exactly that distinction, because
+//! "verified against what the registry published" and "internally consistent
+//! with itself" are different claims and only one of them is what "verified"
+//! usually means.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -47,6 +57,15 @@ pub enum Reference {
     },
     /// A GGUF already on disk. No catalog, no download, no opinions.
     Local { path: String },
+    /// A direct download. Neither registry: no manifest, no repo listing, no
+    /// published digest — just a URL that is supposed to be a GGUF.
+    Url {
+        url: String,
+        /// Pinned via a `#sha256:HEX` fragment. `None` means hearth will hash
+        /// the file itself after downloading and trust that — self-consistent,
+        /// not registry-verified, and `hearth why` says which.
+        sha256: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +122,15 @@ impl Reference {
                 path: rest.to_string(),
             });
         }
+        // http(s):// BEFORE the path heuristic below. `looks_like_path` matches
+        // anything ending in `.gguf`, and a direct download URL to a GGUF is
+        // exactly that — the same class of bug the `file:` fix above exists
+        // for, on a scheme that has no fallback interpretation at all: a URL
+        // read as a local path just fails to open, with an error that sends
+        // the reader looking at their filesystem instead of their network.
+        if s.starts_with("http://") || s.starts_with("https://") {
+            return parse_url(s);
+        }
 
         // No scheme. Does it look like a path?
         if looks_like_path(s) {
@@ -140,6 +168,7 @@ impl Reference {
                 format!("hf/{owner}/{repo}@{revision}#{q}")
             }
             Reference::Local { path } => format!("local/{path}"),
+            Reference::Url { url, .. } => format!("url/{url}"),
         }
     }
 
@@ -170,6 +199,18 @@ impl Reference {
                 .unwrap_or(path)
                 .trim_end_matches(".gguf")
                 .to_string(),
+            Reference::Url { url, .. } => {
+                // The filename off the end of the path, query string dropped
+                // first so `?token=…` does not end up in a model name.
+                let without_query = url.split(['?', '#']).next().unwrap_or(url);
+                without_query
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(url)
+                    .trim_end_matches(".gguf")
+                    .to_string()
+            }
         }
     }
 
@@ -233,6 +274,33 @@ fn parse_hf(rest: &str) -> Result<Reference, ParseError> {
         revision,
         quant,
     })
+}
+
+/// A pinned digest rides in a `#sha256:HEX` fragment — the same "extra
+/// context after `#`" convention `hf:` already uses for a revision, so a
+/// reference reader learns one rule instead of one per scheme.
+fn parse_url(s: &str) -> Result<Reference, ParseError> {
+    match s.split_once('#') {
+        None => Ok(Reference::Url {
+            url: s.to_string(),
+            sha256: None,
+        }),
+        Some((url, frag)) => {
+            let hex = frag.strip_prefix("sha256:").ok_or_else(|| {
+                bad(format!(
+                    "unrecognised fragment \"#{frag}\" on a URL reference — \
+                     the only one hearth understands is #sha256:HEX"
+                ))
+            })?;
+            if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(bad(format!("\"{hex}\" after #sha256: is not a hex digest")));
+            }
+            Ok(Reference::Url {
+                url: url.to_string(),
+                sha256: Some(hex.to_ascii_lowercase()),
+            })
+        }
+    }
 }
 
 fn parse_ollama(rest: &str) -> Result<Reference, ParseError> {
@@ -346,5 +414,94 @@ mod file_scheme_tests {
         let r = Reference::parse("file:/models/muse.gguf").unwrap();
         assert_eq!(r.display_name(), "muse");
         assert_eq!(r.key(), "local//models/muse.gguf");
+    }
+}
+
+#[cfg(test)]
+mod url_scheme_tests {
+    use super::*;
+
+    /// The bug this scheme exists to fix: a direct download URL that ends in
+    /// `.gguf` — every realistic one — matched `looks_like_path` and became
+    /// `Reference::Local`, a path that cannot be opened. The error a user saw
+    /// pointed at their filesystem for a problem that was on the network.
+    #[test]
+    fn a_gguf_url_is_not_mistaken_for_a_local_path() {
+        for scheme in ["http", "https"] {
+            let input = format!("{scheme}://example.com/models/model.gguf");
+            match Reference::parse(&input).expect(&input) {
+                Reference::Url { url, sha256 } => {
+                    assert_eq!(url, input);
+                    assert_eq!(sha256, None);
+                }
+                other => panic!("{input} should be Url, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_pinned_sha256_fragment_is_read_and_lowercased() {
+        let r = Reference::parse(
+            "https://example.com/m.gguf#sha256:DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF",
+        )
+        .unwrap();
+        match r {
+            Reference::Url { sha256, .. } => assert_eq!(
+                sha256.as_deref(),
+                Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+            ),
+            other => panic!("expected Url, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fragment_that_is_not_sha256_is_a_named_error() {
+        let err = Reference::parse("https://example.com/m.gguf#refs/pr/3").unwrap_err();
+        assert!(err.0.contains("sha256:"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_non_hex_digest_is_refused_rather_than_stored_wrong() {
+        let err = Reference::parse("https://example.com/m.gguf#sha256:not-hex").unwrap_err();
+        assert!(err.0.contains("not a hex digest"), "{}", err.0);
+    }
+
+    #[test]
+    fn an_empty_digest_fragment_is_refused() {
+        assert!(Reference::parse("https://example.com/m.gguf#sha256:").is_err());
+    }
+
+    #[test]
+    fn display_name_is_the_filename_with_the_query_string_dropped() {
+        let r = Reference::parse("https://cdn.example.com/models/muse.gguf?token=abc123").unwrap();
+        assert_eq!(
+            r.display_name(),
+            "muse",
+            "a query-string token must never end up in a model name"
+        );
+    }
+
+    #[test]
+    fn display_name_falls_back_to_the_whole_url_when_the_path_is_empty() {
+        let r = Reference::parse("https://example.com/").unwrap();
+        assert_eq!(r.display_name(), "https://example.com/");
+    }
+
+    #[test]
+    fn key_is_stable_across_calls_for_the_same_url() {
+        let r = Reference::parse("https://example.com/m.gguf").unwrap();
+        assert_eq!(
+            r.key(),
+            Reference::parse("https://example.com/m.gguf")
+                .unwrap()
+                .key()
+        );
+        assert_eq!(r.key(), "url/https://example.com/m.gguf");
+    }
+
+    #[test]
+    fn a_url_needs_a_download_like_every_non_local_reference() {
+        let r = Reference::parse("https://example.com/m.gguf").unwrap();
+        assert!(r.needs_download());
     }
 }

@@ -85,14 +85,27 @@ pub fn blob_path(blobs_dir: &Path, digest: &str) -> PathBuf {
 /// claims a digest its *contents* do not have — and every later run trusts the
 /// name. The rename is the commit.
 pub fn fetch_blob(blob: &Blob, cfg: &PullConfig) -> Result<(PathBuf, u64, bool), String> {
-    let final_path = blob_path(&cfg.blobs_dir, &blob.digest);
+    match &blob.digest {
+        Some(digest) => fetch_blob_verified(blob, digest, cfg),
+        None => fetch_blob_self_verified(blob, cfg),
+    }
+}
+
+/// The original path: a digest is already known, so the final home is known
+/// before a single byte moves, and every byte is checked against it.
+fn fetch_blob_verified(
+    blob: &Blob,
+    digest: &str,
+    cfg: &PullConfig,
+) -> Result<(PathBuf, u64, bool), String> {
+    let final_path = blob_path(&cfg.blobs_dir, digest);
 
     if final_path.exists() {
         let len = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
         if cfg.verify_existing {
             let actual = sha256::hex_digest_file(&final_path)
                 .map_err(|e| format!("could not read {}: {e}", final_path.display()))?;
-            if !sha256::matches(&blob.digest, &actual) {
+            if !sha256::matches(digest, &actual) {
                 // On disk under a digest it does not have. Say so loudly and
                 // re-fetch rather than quietly serving the wrong weights.
                 eprintln!(
@@ -118,24 +131,11 @@ pub fn fetch_blob(blob: &Blob, cfg: &PullConfig) -> Result<(PathBuf, u64, bool),
     }
 
     let partial = final_path.with_extension("partial");
-    let req = {
-        let mut r = curl::Request::get(&blob.url).to_file(&partial);
-        for (k, v) in &blob.headers {
-            r = r.header(k, v);
-        }
-        // Resume only if there is something to resume; `-C -` on a missing file
-        // is fine, but on a zero-byte one some servers answer 416.
-        if partial.exists() && std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0) > 0 {
-            r = r.resuming();
-        }
-        r
-    };
-
-    curl::fetch_file(&req, cfg.progress).map_err(|e| e.0)?;
+    download_to(&partial, blob, cfg)?;
 
     let actual = sha256::hex_digest_file(&partial)
         .map_err(|e| format!("could not hash {}: {e}", partial.display()))?;
-    if !sha256::matches(&blob.digest, &actual) {
+    if !sha256::matches(digest, &actual) {
         // Delete it. Keeping a blob that failed verification is how a corrupt
         // download becomes a permanent, cached, corrupt download.
         let _ = std::fs::remove_file(&partial);
@@ -144,7 +144,7 @@ pub fn fetch_blob(blob: &Blob, cfg: &PullConfig) -> Result<(PathBuf, u64, bool),
              the file has been deleted; a resumed transfer over a proxy that \
              rewrote a range will do this, so a plain retry is worth one attempt",
             blob.name,
-            sha256::normalize(&blob.digest),
+            sha256::normalize(digest),
             actual
         ));
     }
@@ -153,6 +153,86 @@ pub fn fetch_blob(blob: &Blob, cfg: &PullConfig) -> Result<(PathBuf, u64, bool),
     std::fs::rename(&partial, &final_path)
         .map_err(|e| format!("could not commit {}: {e}", final_path.display()))?;
     Ok((final_path, len, false))
+}
+
+/// No digest was published to check against — a bare URL, or a HuggingFace
+/// file the tree listing did not mark as LFS.
+///
+/// The final home cannot be known before downloading, because the digest
+/// that names it is the thing being discovered. So this downloads to a
+/// TEMPORARY name (never a content-addressed one — a partial file must never
+/// sit under the name its finished content will claim), hashes what actually
+/// arrived, and only then computes the path a verified blob would have had
+/// from the start. If that path already exists, this exact content was
+/// already fetched under some other name, and the new download is discarded
+/// as a duplicate rather than kept as a second copy of the same bytes.
+///
+/// This is self-consistency, not verification: the file matches its own
+/// name by construction, which is trivially true of every file and proves
+/// nothing about whether the content is what the operator meant to fetch.
+/// Callers that need real verification pin a digest — the URL scheme's
+/// `#sha256:HEX` fragment exists for exactly that.
+fn fetch_blob_self_verified(blob: &Blob, cfg: &PullConfig) -> Result<(PathBuf, u64, bool), String> {
+    std::fs::create_dir_all(&cfg.blobs_dir).map_err(|e| e.to_string())?;
+    let safe_name = blob
+        .name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let partial = cfg
+        .blobs_dir
+        .join(format!("{safe_name}.unverified.partial"));
+
+    download_to(&partial, blob, cfg)?;
+
+    let actual = sha256::hex_digest_file(&partial)
+        .map_err(|e| format!("could not hash {}: {e}", partial.display()))?;
+    let final_path = blob_path(&cfg.blobs_dir, &actual);
+
+    if final_path.exists() {
+        // Already have this exact content under its rightful name — this
+        // download was redundant, not wrong.
+        let _ = std::fs::remove_file(&partial);
+        let len = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+        return Ok((final_path, len, true));
+    }
+
+    let len = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+    std::fs::rename(&partial, &final_path)
+        .map_err(|e| format!("could not commit {}: {e}", final_path.display()))?;
+    eprintln!(
+        "hearth: {} has no published digest — stored as sha256:{actual}, \
+         self-consistent only (not checked against a source, because the \
+         source published none)",
+        blob.name
+    );
+    Ok((final_path, len, false))
+}
+
+/// Download one blob to `dest`, resuming a partial transfer if one is
+/// already there. Shared by both verification paths — they differ in what
+/// happens to the bytes afterward, not in how the bytes arrive.
+fn download_to(dest: &Path, blob: &Blob, cfg: &PullConfig) -> Result<(), String> {
+    let req = {
+        let mut r = curl::Request::get(&blob.url).to_file(dest);
+        for (k, v) in &blob.headers {
+            r = r.header(k, v);
+        }
+        // Resume only if there is something to resume; `-C -` on a missing file
+        // is fine, but on a zero-byte one some servers answer 416.
+        if dest.exists() && std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0) > 0 {
+            r = r.resuming();
+        }
+        r
+    };
+    curl::fetch_file(&req, cfg.progress).map_err(|e| e.0)?;
+    Ok(())
 }
 
 /// Pull a model reference, recording the whole thing in the spine.
@@ -316,8 +396,9 @@ mod tests {
         let blob = Blob {
             name: "weights".into(),
             url: format!("file://{}", served.display()),
-            digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                .into(),
+            digest: Some(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+            ),
             size_bytes: 0,
             headers: vec![],
             is_weights: true,
@@ -325,14 +406,13 @@ mod tests {
 
         let err = fetch_blob(&blob, &cfg).unwrap_err();
         assert!(err.contains("digest mismatch"), "{err}");
+        let digest = blob.digest.as_deref().unwrap();
         assert!(
-            !blob_path(&blobs, &blob.digest).exists(),
+            !blob_path(&blobs, digest).exists(),
             "a blob that failed verification must not be left on disk"
         );
         assert!(
-            !blob_path(&blobs, &blob.digest)
-                .with_extension("partial")
-                .exists(),
+            !blob_path(&blobs, digest).with_extension("partial").exists(),
             "and neither must the partial"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -355,7 +435,7 @@ mod tests {
         let blob = Blob {
             name: "weights".into(),
             url: format!("file://{}", served.display()),
-            digest: sha256::hex_digest(body),
+            digest: Some(sha256::hex_digest(body)),
             size_bytes: body.len() as u64,
             headers: vec![],
             is_weights: true,
@@ -396,7 +476,7 @@ mod tests {
         let blob = Blob {
             name: "weights".into(),
             url: format!("file://{}", served.display()),
-            digest,
+            digest: Some(digest),
             size_bytes: body.len() as u64,
             headers: vec![],
             is_weights: true,
@@ -405,6 +485,129 @@ mod tests {
         assert!(!cached, "the size did not match, so it was not trusted");
         assert_eq!(len, body.len() as u64);
         assert_eq!(std::fs::read(&path).unwrap(), body);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- fetch_blob_self_verified: no published digest to check against ----
+
+    #[test]
+    fn no_digest_still_lands_the_file_under_its_own_computed_sha256() {
+        // A bare URL pull: nothing published a digest, so `blob.digest` is
+        // `None`. The file must still end up content-addressed — hearth
+        // computes the digest itself rather than trusting a caller-supplied
+        // filename for the final path.
+        let dir = std::env::temp_dir().join("hearth-pull-no-digest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = b"weights nobody published a digest for";
+        let served = dir.join("served.bin");
+        std::fs::write(&served, body).unwrap();
+
+        let blobs = dir.join("blobs");
+        let cfg = PullConfig {
+            blobs_dir: blobs.clone(),
+            progress: false,
+            verify_existing: false,
+        };
+        let blob = Blob {
+            name: "model.gguf".into(),
+            url: format!("file://{}", served.display()),
+            digest: None,
+            size_bytes: 0,
+            headers: vec![],
+            is_weights: true,
+        };
+
+        let (path, len, cached) = fetch_blob(&blob, &cfg).unwrap();
+        assert!(!cached);
+        assert_eq!(len, body.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+
+        let expected_name = format!("sha256-{}", sha256::hex_digest(body));
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            expected_name,
+            "the final path must be the digest hearth computed, not a guess"
+        );
+        assert!(
+            !blobs.join("model.gguf.unverified.partial").exists(),
+            "the working file must not survive under its temporary name"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_second_no_digest_pull_of_identical_content_is_recognised_as_cached() {
+        // Two different URLs (or the same URL fetched twice under different
+        // callers) that happen to serve byte-identical content must land on
+        // the SAME blob, not two copies — that is the entire point of
+        // content addressing, and the no-digest path has to preserve it even
+        // though it does not know the address until after downloading.
+        let dir = std::env::temp_dir().join("hearth-pull-no-digest-dup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = b"identical weights served from two places";
+        let served = dir.join("served.bin");
+        std::fs::write(&served, body).unwrap();
+
+        let blobs = dir.join("blobs");
+        let cfg = PullConfig {
+            blobs_dir: blobs.clone(),
+            progress: false,
+            verify_existing: false,
+        };
+        let blob = Blob {
+            name: "model.gguf".into(),
+            url: format!("file://{}", served.display()),
+            digest: None,
+            size_bytes: 0,
+            headers: vec![],
+            is_weights: true,
+        };
+
+        let (first_path, ..) = fetch_blob(&blob, &cfg).unwrap();
+        let (second_path, _, cached) = fetch_blob(&blob, &cfg).unwrap();
+        assert!(
+            cached,
+            "identical content must be recognised, not re-stored"
+        );
+        assert_eq!(first_path, second_path);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unsafe_blob_name_does_not_escape_the_blobs_directory() {
+        // blob.name comes from a URL path or a registry listing — untrusted
+        // input. A name containing "../" must not let the temporary working
+        // file land outside blobs_dir.
+        let dir = std::env::temp_dir().join("hearth-pull-unsafe-name");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = b"contents";
+        let served = dir.join("served.bin");
+        std::fs::write(&served, body).unwrap();
+
+        let blobs = dir.join("blobs");
+        let cfg = PullConfig {
+            blobs_dir: blobs.clone(),
+            progress: false,
+            verify_existing: false,
+        };
+        let blob = Blob {
+            name: "../../etc/model.gguf".into(),
+            url: format!("file://{}", served.display()),
+            digest: None,
+            size_bytes: 0,
+            headers: vec![],
+            is_weights: true,
+        };
+
+        let (path, ..) = fetch_blob(&blob, &cfg).unwrap();
+        assert!(
+            path.starts_with(&blobs),
+            "the final path must stay under blobs_dir, got {}",
+            path.display()
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
