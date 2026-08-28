@@ -15,7 +15,12 @@ export declare class HearthFleet {
    *
    * `gpuPresent` on a probe_failed is the single most important field that
    * crosses this boundary: it is what separates the runtime dropping a model
-   * from the host taking the card away.
+   * from the host taking the card away. Either spelling is accepted —
+   * `gpuPresent` or `gpu_present` — because the mapping now lives in the
+   * core, once, instead of once per binding with different key names.
+   *
+   * Throws on an unrecognised `kind`. It used to return silently, which
+   * meant a typo looked exactly like a model that never changed state.
    */
   observe(model: string, kind: string, detail: any, now: number): void
   /** What should a router do with a request for this model? */

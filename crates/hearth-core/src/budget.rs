@@ -209,6 +209,17 @@ pub fn declared_from_json(v: &serde_json::Value) -> Result<Vec<Declared>, Vec<St
 }
 
 /// A size in bytes, from either an integer or an integer-valued float.
+///
+/// Public because the bindings need exactly this leniency for every byte count
+/// that crosses a language boundary, not just roster entries. JS has no
+/// integers: every number arrives as `f64`, so a bare `as_u64()` returns `None`
+/// for a perfectly good size and the value silently becomes zero. That bug ate
+/// whole rosters in 0.1.0 and was still eating `vramBytes` on `probe_ok` after.
+pub fn whole_bytes(v: &serde_json::Value) -> Option<u64> {
+    size_of(Some(v))
+}
+
+/// A size in bytes, from either an integer or an integer-valued float.
 fn size_of(v: Option<&serde_json::Value>) -> Option<u64> {
     let v = v?;
     if let Some(n) = v.as_u64() {
