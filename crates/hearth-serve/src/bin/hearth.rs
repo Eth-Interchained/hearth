@@ -12,7 +12,32 @@
 //! running, because the history is the database, not a process's memory.
 
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// SIGINT/SIGTERM latch. The handler only flips a bool — all real work
+/// (stop children, record `unloaded`, flush the spine) happens on the
+/// supervise loop, because a signal handler that touches a database is a
+/// signal handler that corrupts one. Found live: without this, killing
+/// the supervisor leaked the llama-server child and lost the final events.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_sig: i32) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    // SAFETY: on_signal is async-signal-safe — it writes one atomic bool.
+    unsafe {
+        extern "C" {
+            fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+        }
+        const SIGINT: i32 = 2;
+        const SIGTERM: i32 = 15;
+        signal(SIGINT, on_signal);
+        signal(SIGTERM, on_signal);
+    }
+}
 
 use hearth_core::{Budget, Declared, GIB};
 use hearth_serve::server::{free_port, runtime_available, ServerSpec};
@@ -100,6 +125,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
         kv_bytes: 0,
     }];
 
+    install_signal_handlers();
     let mut sup = Supervisor::new(open_spine()?, budget, declared);
     sup.start(spec)?;
     eprintln!("hearth: {model} loading on 127.0.0.1:{port} …");
@@ -113,15 +139,20 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    // Supervise forever. Every transition lands in the spine as it happens.
-    loop {
-        std::thread::sleep(Duration::from_secs(2));
+    // Supervise until told to stop. Every transition lands in the spine as
+    // it happens; a SIGINT/SIGTERM records `unloaded`, reaps the child, and
+    // flushes — a kill is an event in the history, not the end of it.
+    while !SHUTDOWN.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(500));
         let n = sup.tick();
         if n > 0 {
             eprintln!("hearth: {n} transition(s) recorded");
             eprint!("{}", sup.report());
         }
     }
+    eprintln!("hearth: shutting down — recording unloaded, reaping children");
+    sup.stop_all();
+    Ok(())
 }
 
 fn cmd_status() -> Result<(), String> {

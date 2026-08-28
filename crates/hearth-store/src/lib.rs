@@ -182,6 +182,11 @@ impl Spine {
             .db
             .put(coll, model, doc, causes, None, None)
             .map_err(|e| e.to_string())?;
+        // Transitions are rare and each one is a fact someone may need after
+        // a crash — durability at event granularity, not process-exit
+        // granularity. A supervisor that loses its history on SIGKILL has a
+        // spine made of RAM. (Found live: the first e2e run lost everything.)
+        self.flush();
         Ok(EventRef::of(&node))
     }
 
