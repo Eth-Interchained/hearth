@@ -20,7 +20,36 @@ pub struct ServerSpec {
     /// The llama-server binary. Default: "llama-server" on PATH.
     pub binary: PathBuf,
     /// Context size. 0 = llama-server's default.
+    ///
+    /// Note this is the TOTAL context divided across slots by llama-server, so
+    /// `--ctx 8192 --parallel 4` gives each concurrent request 2048 — not 8192
+    /// each. Sizing it as if every slot got the full window is the most common
+    /// way a "parallel" server starts truncating prompts.
     pub ctx: u32,
+    /// Concurrent request slots. This is what makes a server able to answer two
+    /// callers at once; llama-server defaults to ONE, which means every request
+    /// after the first waits for the one in front of it.
+    ///
+    /// hearth defaults to 8 because a production node fronting a router is
+    /// answering more than one caller, and a serving stack that silently
+    /// serializes looks exactly like a slow model. Each slot costs its own KV
+    /// cache, which is why the budget wants to know.
+    pub parallel: u32,
+    /// Layers to offload to the GPU. `None` means all of them (`-1`).
+    ///
+    /// llama.cpp's own default is 0 — CPU. A model runner that quietly runs a
+    /// 20 GiB model on the CPU is not slow by a little; it is two orders of
+    /// magnitude off, and it looks like a hardware problem rather than a
+    /// missing flag. If the model did not fit the planner would already have
+    /// refused it, so "all of them" is the honest default here.
+    pub gpu_layers: Option<i32>,
+    /// Keep the whole model in RAM rather than letting the OS page it out.
+    /// On by default: a paged-out weight page turns the first token after an
+    /// idle period into a disk read.
+    pub mlock: bool,
+    /// Continuous batching. Only meaningful with more than one slot, and the
+    /// reason parallel slots actually help instead of just interleaving.
+    pub cont_batching: bool,
     /// Extra args passed through verbatim, after ours.
     pub extra_args: Vec<String>,
     /// Directory for stdout/stderr capture files.
@@ -35,6 +64,10 @@ impl ServerSpec {
             port,
             binary: PathBuf::from("llama-server"),
             ctx: 0,
+            parallel: 8,
+            gpu_layers: None,
+            mlock: true,
+            cont_batching: true,
             extra_args: Vec::new(),
             log_dir: std::env::temp_dir(),
         }
@@ -59,6 +92,27 @@ impl ServerSpec {
             args.push("-c".to_string());
             args.push(self.ctx.to_string());
         }
+        // All layers on the GPU unless told otherwise. llama.cpp defaults to 0
+        // — CPU — and a 20 GiB model quietly running on CPU reads as broken
+        // hardware, not as a missing flag.
+        args.push("--n-gpu-layers".to_string());
+        args.push(match self.gpu_layers {
+            Some(n) => n.to_string(),
+            None => "-1".to_string(),
+        });
+        if self.parallel > 0 {
+            args.push("--parallel".to_string());
+            args.push(self.parallel.to_string());
+        }
+        // Continuous batching is what makes extra slots serve concurrent
+        // callers rather than just queue them differently.
+        if self.cont_batching && self.parallel > 1 {
+            args.push("--cont-batching".to_string());
+        }
+        if self.mlock {
+            args.push("--mlock".to_string());
+        }
+        // Caller's args go LAST so an operator can override any default above.
         args.extend(self.extra_args.iter().cloned());
         args
     }
@@ -171,6 +225,10 @@ mod tests {
 
     #[test]
     fn argv_is_exactly_what_we_run() {
+        // Exact, deliberately. A loose assertion here would not have noticed
+        // that hearth shipped WITHOUT --n-gpu-layers or --parallel, which meant
+        // llama.cpp's own defaults applied: layers on the CPU and one slot.
+        // This test failing is the correct response to changing that contract.
         let mut spec = ServerSpec::new("muse", "/models/muse.gguf", 8080);
         spec.ctx = 4096;
         spec.extra_args = vec!["-t".into(), "2".into()];
@@ -185,6 +243,14 @@ mod tests {
                 "8080",
                 "-c",
                 "4096",
+                // Production defaults, in the order argv() emits them.
+                "--n-gpu-layers",
+                "-1",
+                "--parallel",
+                "8",
+                "--cont-batching",
+                "--mlock",
+                // The operator's own arguments last, so they win.
                 "-t",
                 "2"
             ]
@@ -246,5 +312,107 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(code.is_some(), "child never exited");
+    }
+}
+
+#[cfg(test)]
+mod production_defaults {
+    use super::*;
+
+    fn argv_of(spec: &ServerSpec) -> Vec<String> {
+        spec.argv()
+    }
+
+    fn pair(argv: &[String], flag: &str) -> Option<String> {
+        argv.iter()
+            .position(|a| a == flag)
+            .map(|i| argv[i + 1].clone())
+    }
+
+    #[test]
+    fn all_layers_go_to_the_gpu_by_default() {
+        // llama.cpp's own default is 0 — CPU. hearth shipped without this flag
+        // at all, so a 20 GiB model ran wherever the build happened to default,
+        // and CPU inference on a serving node reads as broken hardware rather
+        // than as a missing argument.
+        let argv = argv_of(&ServerSpec::new("m", "/m.gguf", 8080));
+        assert_eq!(pair(&argv, "--n-gpu-layers").as_deref(), Some("-1"));
+    }
+
+    #[test]
+    fn a_node_answers_more_than_one_caller_by_default() {
+        // llama-server defaults to ONE slot: every request after the first
+        // waits for the one in front of it, which looks exactly like a slow
+        // model rather than a serialized one.
+        let argv = argv_of(&ServerSpec::new("m", "/m.gguf", 8080));
+        assert_eq!(pair(&argv, "--parallel").as_deref(), Some("8"));
+        assert!(
+            argv.iter().any(|a| a == "--cont-batching"),
+            "extra slots without continuous batching just queue differently"
+        );
+    }
+
+    #[test]
+    fn one_slot_means_no_continuous_batching() {
+        // With a single slot the flag is noise, and noise in an argv is how a
+        // reader stops trusting the rest of it.
+        let spec = ServerSpec {
+            parallel: 1,
+            ..ServerSpec::new("m", "/m.gguf", 8080)
+        };
+        assert!(!spec.argv().iter().any(|a| a == "--cont-batching"));
+    }
+
+    #[test]
+    fn the_operators_own_arguments_win() {
+        // Defaults are a starting point, not a policy. Ours go first so the
+        // caller's --n-gpu-layers overrides rather than conflicts.
+        let spec = ServerSpec {
+            extra_args: vec!["--n-gpu-layers".into(), "20".into()],
+            ..ServerSpec::new("m", "/m.gguf", 8080)
+        };
+        let argv = spec.argv();
+        let ours = argv.iter().position(|a| a == "--n-gpu-layers").unwrap();
+        let theirs = argv.iter().rposition(|a| a == "--n-gpu-layers").unwrap();
+        assert!(theirs > ours, "the caller's copy must come last to win");
+        assert_eq!(argv[theirs + 1], "20");
+    }
+
+    #[test]
+    fn gpu_layers_can_be_pinned_including_to_cpu() {
+        // A CPU-only box is a real deployment; it just must be chosen, not
+        // arrived at by accident.
+        let spec = ServerSpec {
+            gpu_layers: Some(0),
+            ..ServerSpec::new("m", "/m.gguf", 8080)
+        };
+        assert_eq!(pair(&spec.argv(), "--n-gpu-layers").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn mlock_keeps_the_weights_off_the_disk() {
+        // A paged-out weight page turns the first token after an idle period
+        // into a disk read, which is the "why was it slow just that once"
+        // report nobody can reproduce.
+        assert!(ServerSpec::new("m", "/m.gguf", 8080)
+            .argv()
+            .iter()
+            .any(|a| a == "--mlock"));
+    }
+
+    #[test]
+    fn the_context_is_still_bound_to_the_port_and_model() {
+        // The defaults must not have displaced the arguments that identify
+        // WHICH model on WHICH port — an argv bug here looks like the model
+        // being broken.
+        let spec = ServerSpec {
+            ctx: 8192,
+            ..ServerSpec::new("muse", "/models/muse.gguf", 9001)
+        };
+        let argv = spec.argv();
+        assert_eq!(pair(&argv, "-m").as_deref(), Some("/models/muse.gguf"));
+        assert_eq!(pair(&argv, "--port").as_deref(), Some("9001"));
+        assert_eq!(pair(&argv, "--host").as_deref(), Some("127.0.0.1"));
+        assert_eq!(pair(&argv, "-c").as_deref(), Some("8192"));
     }
 }
