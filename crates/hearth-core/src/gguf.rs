@@ -238,7 +238,10 @@ fn build_shape(facts: RawFacts) -> Result<KvShape, String> {
             "missing \"*.attention.key_length\" and nothing to derive it from \
              (\"*.embedding_length\" and \"*.attention.head_count\")",
         )?;
-    let value_length = facts.value_length.or(facts.key_length).unwrap_or(key_length);
+    let value_length = facts
+        .value_length
+        .or(facts.key_length)
+        .unwrap_or(key_length);
 
     Ok(KvShape {
         block_count,

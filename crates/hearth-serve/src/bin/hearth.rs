@@ -950,8 +950,7 @@ fn kv_bytes_for_model(gguf_path: &str, ctx_flag: u32, parallel: u32) -> u64 {
     let mut reader = std::io::BufReader::new(file);
     match hearth_core::read_kv_shape(&mut reader) {
         Ok(shape) => {
-            let total_ctx =
-                hearth_core::total_ctx_tokens(ctx_flag, shape.context_length, parallel);
+            let total_ctx = hearth_core::total_ctx_tokens(ctx_flag, shape.context_length, parallel);
             shape.kv_bytes_for(total_ctx)
         }
         Err(e) => {
