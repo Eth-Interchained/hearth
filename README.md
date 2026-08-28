@@ -68,10 +68,23 @@ Declare four 20 GiB models on a 48 GiB card and no runtime errors. It loads, evi
 
 **The reserve is never planned into.** Weights aren't the whole cost — KV cache grows with context and parallelism, the CUDA context is hundreds of megabytes, and fragmentation is real on a card that's been up for weeks.
 
+## Install
+
+| package | registry | what you get |
+|---|---|---|
+| [`hearth-serve`](crates/hearth-serve/README.md) | [crates.io](https://crates.io/crates/hearth-serve) | `cargo install hearth-serve` — the `hearth` binary |
+| [`hearth-core`](crates/hearth-core/README.md) | [crates.io](https://crates.io/crates/hearth-core) | the decision procedure, no GPU needed |
+| [`hearth-store`](crates/hearth-store/README.md) | [crates.io](https://crates.io/crates/hearth-store) | the NEDB spine |
+| [`hearth-resolve`](crates/hearth-resolve/README.md) | [crates.io](https://crates.io/crates/hearth-resolve) | Ollama + HuggingFace resolution |
+| [`@interchained/hearth`](crates/hearth-node/README.md) | [npm](https://www.npmjs.com/package/@interchained/hearth) | Node bindings, prebuilt for 4 platforms |
+| [`hearth-engine`](crates/hearth-py/README.md) | [PyPI](https://pypi.org/project/hearth-engine/) | Python bindings, one abi3 wheel per platform |
+
+Each package page is written for the language you land in — the API is the same core either way, but the key names are idiomatic per language and [should not be copied between them](examples/README.md#one-thing-to-watch).
+
 ## Status
 
 `hearth-core` — state machine, VRAM planner, fleet routing. Pure logic, no GPU required.
-`hearth-resolve` — one reference syntax over the Ollama registry and HuggingFace GGUFs, verified against the live registries.
+`hearth-resolve` — one reference syntax over the Ollama registry and HuggingFace GGUFs, verified against the live registries. **Resolution only: it plans blob URLs and byte counts, and fetches nothing** — `serde` and `serde_json` are its entire dependency list.
 `hearth-store` — **the NEDB spine.** Every residency transition is a bi-temporal, causally-linked, tamper-evident event in an embedded [NEDB](https://github.com/Eth-Interchained/nedb). Not a log on the side: the supervisor's memory IS the database.
 `hearth-serve` — the supervisor. `llama-server` children, honest health probes, `gpu_present` via nvidia-smi (an honest `None` on CPU boxes), SIGTERM records `unloaded` and reaps children. Plus the `hearth` CLI.
 
@@ -101,9 +114,11 @@ hearth speaks OpenAI-compatible, so [pin-clientd](https://github.com/aiassistsec
 
 ## Build
 
+Every snippet in every README here is a **runnable example** — see [`examples/`](examples/README.md). The numbers in the docs were pasted out of real runs, not written by hand.
+
 ```bash
 cargo test --workspace   # no GPU needed
-cargo run --example a6000
+cargo run -p hearth-core --example quickstart
 
 # serve a model under supervision (needs llama.cpp's llama-server)
 hearth serve --model muse --gguf ./muse.gguf --port 8080

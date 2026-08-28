@@ -7,6 +7,7 @@ version = "0.3.2"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/aiassistsecure/hearth"
+homepage = "https://github.com/aiassistsecure/hearth"
 authors = ["Interchained LLC"]
 
 [workspace.dependencies]

@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["llm", "gguf", "ollama", "huggingface", "registry"]
+categories = ["parsing", "network-programming"]
+documentation = "https://docs.rs/hearth-resolve"
+homepage.workspace = true
 authors.workspace = true
 
 [dependencies]

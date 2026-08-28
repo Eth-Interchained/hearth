@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["nedb", "bitemporal", "provenance", "audit", "llm"]
+categories = ["database", "data-structures"]
+documentation = "https://docs.rs/hearth-store"
+homepage.workspace = true
 authors.workspace = true
 
 [dependencies]

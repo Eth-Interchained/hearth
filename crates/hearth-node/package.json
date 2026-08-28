@@ -5,7 +5,7 @@
   "license": "BUSL-1.1",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Eth-Interchained/hearth.git"
+    "url": "git+https://github.com/aiassistsecure/hearth.git"
   },
   "main": "index.js",
   "types": "index.d.ts",
@@ -48,5 +48,9 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "homepage": "https://github.com/aiassistsecure/hearth",
+  "bugs": {
+    "url": "https://github.com/aiassistsecure/hearth/issues"
   }
 }

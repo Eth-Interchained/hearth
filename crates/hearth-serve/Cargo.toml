@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["llm", "supervisor", "llama-cpp", "gpu", "serving"]
+categories = ["command-line-utilities", "network-programming"]
+documentation = "https://docs.rs/hearth-serve"
+homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
