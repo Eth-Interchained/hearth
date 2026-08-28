@@ -87,6 +87,27 @@ fn open_spine() -> Result<Spine, String> {
 ///
 /// The recording is the part no other tool does. Months later, "where did this
 /// file come from" is `hearth why <model>` rather than an archaeology project.
+/// A tunable: command-line flag wins, then the environment, then the default.
+///
+/// Flags beat env deliberately — an operator typing a flag is expressing intent
+/// NOW, while an env var is standing configuration. The reverse order makes a
+/// debugging session fight the deployment.
+fn tunable<T: std::str::FromStr>(args: &[String], flag_name: &str, env: &str, default: T) -> T {
+    if let Some(v) = flag(args, flag_name) {
+        if let Ok(t) = v.parse() {
+            return t;
+        }
+        eprintln!("hearth: {flag_name} {v:?} is not a valid value — using the default");
+    }
+    if let Ok(v) = std::env::var(env) {
+        if let Ok(t) = v.parse() {
+            return t;
+        }
+        eprintln!("hearth: {env}={v:?} is not a valid value — using the default");
+    }
+    default
+}
+
 fn cmd_pull(args: &[String]) -> Result<(), String> {
     let reference = args
         .iter()
@@ -146,18 +167,27 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
                 .into(),
         );
     }
-    let api_port: u16 = flag(args, "--port")
-        .map(|v| v.parse().map_err(|e| format!("--port: {e}")))
-        .transpose()?
-        .unwrap_or(11434);
+    let api_port: u16 = tunable(args, "--port", "HEARTH_PORT", 11434);
     let total_gib: u64 = flag(args, "--total-gib")
         .map(|v| v.parse().map_err(|e| format!("--total-gib: {e}")))
         .transpose()?
         .unwrap_or(24);
-    let ctx: u32 = flag(args, "--ctx")
-        .map(|v| v.parse().map_err(|e| format!("--ctx: {e}")))
-        .transpose()?
-        .unwrap_or(0);
+    // Every knob: flag beats env beats default, so a deployment sets
+    // HEARTH_* once and a debugging session overrides per-run.
+    let ctx: u32 = tunable(args, "--ctx", "HEARTH_CTX", 0);
+    // Concurrent slots per model. llama-server's own default is 1, which
+    // serializes every caller behind the one in front of them. 8 because a
+    // production node fronting a router is answering more than one caller,
+    // and each slot's KV cache is already inside the declared budget.
+    let parallel: u32 = tunable(args, "--parallel", "HEARTH_PARALLEL", 8);
+    let gpu_layers: Option<i32> = {
+        let v: i32 = tunable(args, "--gpu-layers", "HEARTH_GPU_LAYERS", -1);
+        if v < 0 {
+            None
+        } else {
+            Some(v)
+        }
+    };
 
     let budget = Budget {
         total_bytes: total_gib * GIB,
@@ -186,6 +216,8 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
         let port = free_port()?;
         let mut spec = ServerSpec::new(name, gguf, port);
         spec.ctx = ctx;
+        spec.parallel = parallel;
+        spec.gpu_layers = gpu_layers;
         spec.log_dir = log_dir.clone();
         if let Some(b) = flag(args, "--binary") {
             spec.binary = b.into();
@@ -207,6 +239,21 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
     let addr = format!("127.0.0.1:{api_port}");
     let server = hearth_api::Server::bind(&addr)?;
     println!("hearth up on http://{addr}");
+    // Print what was actually chosen. A server whose concurrency you have to
+    // infer from a config file is a server nobody tunes.
+    println!(
+        "  {} slot(s)/model · {} · ctx {}",
+        parallel,
+        match gpu_layers {
+            Some(n) => format!("{n} GPU layer(s)"),
+            None => "all layers on GPU".to_string(),
+        },
+        if ctx == 0 {
+            "runtime default".to_string()
+        } else {
+            format!("{ctx} shared across slots")
+        },
+    );
     println!("  POST /v1/chat/completions   routed by the \"model\" field");
     println!("  GET  /v1/models             what is declared, and what is ready");
     println!("  GET  /residency             the truth the OpenAI shape cannot carry");
@@ -230,6 +277,17 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
         }
     });
 
+    // One thread per connection, bounded. The accept loop used to handle
+    // requests inline, which meant a single generation blocked every other
+    // caller — parallel slots inside llama-server buy nothing if the gateway
+    // in front of them is a queue of one.
+    //
+    // Bounded rather than unbounded because an unbounded spawn is a way to
+    // convert a traffic spike into an OOM. Over the cap we answer 503 with a
+    // Retry-After, which is the honest thing: we are busy, come back.
+    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_inflight: usize = tunable(args, "--max-inflight", "HEARTH_MAX_INFLIGHT", 64);
+
     for conn in server.incoming() {
         if SHUTDOWN.load(Ordering::SeqCst) {
             break;
@@ -241,47 +299,85 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
                 continue;
             }
         };
-        let req = match hearth_api::http::read_request(&stream) {
-            Ok(r) => r,
-            Err(e) => {
-                let body = serde_json::json!({ "error": { "message": e } }).to_string();
-                let _ = stream
-                    .write_all(hearth_api::http::render_response(400, &body, None).as_bytes());
-                continue;
-            }
-        };
 
-        // Decide under the lock; act OUTSIDE it. A generation can take minutes,
-        // and holding the fleet lock across one would stall every other request
-        // and the supervisor with it.
-        let decision = {
-            let s = sup.lock().unwrap();
-            hearth_api::decide(&req.path, &req.body, s.fleet(), hearth_serve::now_ms())
-        };
+        if inflight.load(Ordering::SeqCst) >= max_inflight {
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!(
+                        "hearth is at its in-flight limit ({max_inflight}) — this is \
+                         backpressure, not a failure"),
+                    "type": "server_busy",
+                    "retryable": true,
+                    "operator_fault": false,
+                }
+            })
+            .to_string();
+            let _ =
+                stream.write_all(hearth_api::http::render_response(503, &body, Some(1)).as_bytes());
+            continue;
+        }
 
-        match decision {
-            hearth_api::Decision::Proxy { model, endpoint } => {
-                if let Err(e) =
-                    hearth_api::http::proxy(&endpoint, &req, &mut stream, Duration::from_secs(5))
-                {
-                    // The fleet said ready and the socket disagreed. Report it
-                    // as a gateway failure rather than pretending the model
-                    // answered.
-                    eprintln!("hearth: proxy to {model} at {endpoint} failed: {e}");
-                    let body = serde_json::json!({
-                        "error": { "message": e, "type": "upstream_unreachable" }
-                    })
-                    .to_string();
-                    let _ = stream
-                        .write_all(hearth_api::http::render_response(502, &body, None).as_bytes());
+        let sup = Arc::clone(&sup);
+        let inflight = Arc::clone(&inflight);
+        inflight.fetch_add(1, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            // Decrement no matter how this thread leaves, or the limit ratchets
+            // down until the gateway refuses everything.
+            struct Guard(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
                 }
             }
-            hearth_api::Decision::Answer(r) => {
-                let _ = stream.write_all(
-                    hearth_api::http::render_response(r.status, &r.body, r.retry_after).as_bytes(),
-                );
+            let _guard = Guard(inflight);
+
+            let req = match hearth_api::http::read_request(&stream) {
+                Ok(r) => r,
+                Err(e) => {
+                    let body = serde_json::json!({ "error": { "message": e } }).to_string();
+                    let _ = stream
+                        .write_all(hearth_api::http::render_response(400, &body, None).as_bytes());
+                    return;
+                }
+            };
+
+            // Decide under the lock; act OUTSIDE it. A generation can take
+            // minutes, and holding the fleet lock across one would stall every
+            // other request and the supervisor with it.
+            let decision = {
+                let s = match sup.lock() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                hearth_api::decide(&req.path, &req.body, s.fleet(), hearth_serve::now_ms())
+            };
+
+            match decision {
+                hearth_api::Decision::Proxy { model, endpoint } => {
+                    if let Err(e) = hearth_api::http::proxy(
+                        &endpoint,
+                        &req,
+                        &mut stream,
+                        Duration::from_secs(5),
+                    ) {
+                        eprintln!("hearth: proxy to {model} at {endpoint} failed: {e}");
+                        let body = serde_json::json!({
+                            "error": { "message": e, "type": "upstream_unreachable" }
+                        })
+                        .to_string();
+                        let _ = stream.write_all(
+                            hearth_api::http::render_response(502, &body, None).as_bytes(),
+                        );
+                    }
+                }
+                hearth_api::Decision::Answer(r) => {
+                    let _ = stream.write_all(
+                        hearth_api::http::render_response(r.status, &r.body, r.retry_after)
+                            .as_bytes(),
+                    );
+                }
             }
-        }
+        });
     }
 
     eprintln!("hearth: shutting down — recording unloaded, reaping children");
