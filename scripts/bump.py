@@ -23,6 +23,7 @@ partial bump that reports success is worse than a failure.
 """
 
 import pathlib
+import subprocess
 import re
 import sys
 
@@ -102,8 +103,35 @@ def main():
         return 1
 
     print(f"\n{old} -> {new} across {touched} file(s), no stragglers")
+    refresh_lockfile(new)
     print(f"  cargo test && git commit -am 'chore: v{new}' && git tag -a v{new} -m ...")
     return 0
+
+
+def refresh_lockfile(new):
+    """Make Cargo.lock agree with the manifests we just rewrote.
+
+    bump.py rewrites TOML; it does not run cargo, so the lock keeps the old
+    workspace versions until something builds. v0.3.5 was committed with a lock
+    that still said 0.3.4, and `cargo build --locked` fails outright on that.
+    Same class of miss as an allow-list one entry behind, one file further out.
+    """
+    import shutil
+    if not shutil.which("cargo"):
+        print("  cargo not on PATH — Cargo.lock NOT refreshed, run `cargo check`")
+        return False
+    r = subprocess.run(
+        ["cargo", "update", "--workspace", "--offline"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        # Offline can fail on a cold registry cache; a plain check still
+        # rewrites the lock from the manifests.
+        r = subprocess.run(["cargo", "check", "--workspace", "--quiet"],
+                           capture_output=True, text=True)
+    ok = "version = \"%s\"" % new in pathlib.Path("Cargo.lock").read_text()
+    print(f"  Cargo.lock {'refreshed' if ok else 'NOT updated — check it by hand'}")
+    return ok
 
 
 if __name__ == "__main__":
