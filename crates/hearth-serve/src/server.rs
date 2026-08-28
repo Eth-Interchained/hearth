@@ -43,9 +43,16 @@ pub struct ServerSpec {
     /// missing flag. If the model did not fit the planner would already have
     /// refused it, so "all of them" is the honest default here.
     pub gpu_layers: Option<i32>,
-    /// Keep the whole model in RAM rather than letting the OS page it out.
-    /// On by default: a paged-out weight page turns the first token after an
-    /// idle period into a disk read.
+    /// Lock the model's pages into RAM (`--mlock`). OFF by default, and the
+    /// default matters: with all layers offloaded to the GPU, the host copy of
+    /// the weights is cold after load — mlock pins it in RAM anyway, turning
+    /// droppable page cache into unreclaimable locked memory. On a box whose
+    /// RAM is the same size as its card (a 48 GiB A6000 host with 48 GiB RAM,
+    /// say), locking two 20 GiB models is a system-OOM assist, and it landed
+    /// on exactly that box within hours of shipping as a default.
+    ///
+    /// Turn it on for CPU inference, where a paged-out weight page really does
+    /// turn the first token after an idle period into a disk read.
     pub mlock: bool,
     /// Continuous batching. Only meaningful with more than one slot, and the
     /// reason parallel slots actually help instead of just interleaving.
@@ -66,7 +73,7 @@ impl ServerSpec {
             ctx: 0,
             parallel: 8,
             gpu_layers: None,
-            mlock: true,
+            mlock: false,
             cont_batching: true,
             extra_args: Vec::new(),
             log_dir: std::env::temp_dir(),
@@ -249,7 +256,6 @@ mod tests {
                 "--parallel",
                 "8",
                 "--cont-batching",
-                "--mlock",
                 // The operator's own arguments last, so they win.
                 "-t",
                 "2"
@@ -390,14 +396,22 @@ mod production_defaults {
     }
 
     #[test]
-    fn mlock_keeps_the_weights_off_the_disk() {
-        // A paged-out weight page turns the first token after an idle period
-        // into a disk read, which is the "why was it slow just that once"
-        // report nobody can reproduce.
-        assert!(ServerSpec::new("m", "/m.gguf", 8080)
+    fn mlock_is_opt_in_because_it_pins_host_ram_the_gpu_path_does_not_need() {
+        // Shipped as an always-on default first, and it hit a real box within
+        // hours: 48 GiB A6000 host with 48 GiB RAM, two 20 GiB models — mlock
+        // pinned the cold host copies and helped the system toward OOM. With
+        // full GPU offload the host copy is droppable page cache; locking it
+        // buys nothing and costs the model's size in RAM.
+        assert!(!ServerSpec::new("m", "/m.gguf", 8080)
             .argv()
             .iter()
             .any(|a| a == "--mlock"));
+        // Still there for CPU inference, where it earns its keep.
+        let spec = ServerSpec {
+            mlock: true,
+            ..ServerSpec::new("m", "/m.gguf", 8080)
+        };
+        assert!(spec.argv().iter().any(|a| a == "--mlock"));
     }
 
     #[test]

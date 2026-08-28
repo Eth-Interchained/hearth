@@ -13,7 +13,7 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
-hearth-core = { path = "../hearth-core", version = "0.3.8" }
-hearth-resolve = { path = "../hearth-resolve", version = "0.3.8" }
-hearth-store = { path = "../hearth-store", version = "0.3.8" }
+hearth-core = { path = "../hearth-core", version = "0.3.9" }
+hearth-resolve = { path = "../hearth-resolve", version = "0.3.9" }
+hearth-store = { path = "../hearth-store", version = "0.3.9" }
 serde_json = { workspace = true }

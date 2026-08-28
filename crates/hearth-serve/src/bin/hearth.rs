@@ -365,6 +365,11 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
             Some(v)
         }
     };
+    // mlock is opt-in: with full GPU offload the host weight copy is droppable
+    // page cache, and locking it costs the model's size in RAM for nothing.
+    // For CPU inference (--gpu-layers 0) it is worth turning on.
+    let mlock: bool = args.iter().any(|a| a == "--mlock")
+        || std::env::var("HEARTH_MLOCK").ok().as_deref() == Some("1");
 
     let budget = Budget {
         total_bytes: total_gib * GIB,
@@ -395,6 +400,7 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
         spec.ctx = ctx;
         spec.parallel = parallel;
         spec.gpu_layers = gpu_layers;
+        spec.mlock = mlock;
         spec.log_dir = log_dir.clone();
         if let Some(b) = flag(args, "--binary") {
             spec.binary = b.into();
