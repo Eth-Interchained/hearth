@@ -194,16 +194,43 @@ pub fn hex_digest(data: &[u8]) -> String {
 /// verify it would trade the whole point of the check for a much larger
 /// resident set.
 pub fn hex_digest_file(path: &std::path::Path) -> std::io::Result<String> {
+    hex_digest_file_with_progress(path, |_, _| {})
+}
+
+/// Same digest, with a callback so a caller can show that it is still working.
+///
+/// HASHING A MODEL IS NOT A FAST STEP AND IT LOOKED LIKE A HANG. A 35 GiB
+/// download finishes, curl's meter prints `100.0%`, and then this function ran
+/// for minutes with no output at all — after which the only honest reading of
+/// the terminal is that the process is wedged. `PullConfig::progress` already
+/// states the principle ("a silent twenty-minute pause is indistinguishable
+/// from a hang, and a downloader that looks hung gets killed halfway"); the
+/// verify step simply did not honour it.
+///
+/// `on_progress(bytes_hashed, total_bytes)` is called after every chunk.
+/// `total_bytes` is 0 when the length could not be determined, so a caller
+/// must not divide by it blindly. Throttling is the caller's job — this fires
+/// per 256 KiB chunk and printing that often would be its own problem.
+pub fn hex_digest_file_with_progress(
+    path: &std::path::Path,
+    mut on_progress: impl FnMut(u64, u64),
+) -> std::io::Result<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
+    let total = f.metadata().map(|m| m.len()).unwrap_or(0);
     let mut h = Sha256::new();
     // 256 KiB: large enough that syscall overhead disappears against disk
     // throughput, small enough to stay out of the way on a busy serving box.
     let mut buf = vec![0u8; 256 * 1024];
+    let mut done: u64 = 0;
     loop {
         match f.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => h.update(&buf[..n]),
+            Ok(n) => {
+                h.update(&buf[..n]);
+                done = done.saturating_add(n as u64);
+                on_progress(done, total);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
@@ -376,5 +403,66 @@ mod tests {
         let d = "sha256:ABC123";
         assert_eq!(normalize(d), "abc123");
         assert_eq!(normalize(&normalize(d)), normalize(d));
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    fn tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn progress_variant_returns_the_same_digest() {
+        // A verify step that reports progress but hashes differently would be
+        // worse than a silent one.
+        let p = tmp("hearth_prog_a.bin", &vec![7u8; 900_000]);
+        let plain = hex_digest_file(&p).unwrap();
+        let loud = hex_digest_file_with_progress(&p, |_, _| {}).unwrap();
+        assert_eq!(plain, loud);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn progress_is_monotonic_and_ends_at_the_total() {
+        // 900 KB over a 256 KiB chunk = 4 callbacks, so this also proves the
+        // callback fires more than once on a file bigger than one chunk.
+        let size = 900_000usize;
+        let p = tmp("hearth_prog_b.bin", &vec![3u8; size]);
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        hex_digest_file_with_progress(&p, |done, total| seen.push((done, total))).unwrap();
+        assert!(
+            seen.len() > 1,
+            "expected several callbacks, got {}",
+            seen.len()
+        );
+        assert!(
+            seen.windows(2).all(|w| w[0].0 <= w[1].0),
+            "progress went backwards: {seen:?}"
+        );
+        assert_eq!(
+            seen.last().unwrap().0,
+            size as u64,
+            "final count != file size"
+        );
+        assert!(
+            seen.iter().all(|(_, t)| *t == size as u64),
+            "total must be stable"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn an_empty_file_reports_no_progress_but_still_digests() {
+        let p = tmp("hearth_prog_c.bin", b"");
+        let mut calls = 0;
+        let d = hex_digest_file_with_progress(&p, |_, _| calls += 1).unwrap();
+        assert_eq!(calls, 0, "no chunks were read, so nothing to report");
+        assert_eq!(d, hex_digest_file(&p).unwrap());
+        std::fs::remove_file(&p).ok();
     }
 }

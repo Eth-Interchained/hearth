@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/hearth-core", "crates/hearth-resolve", "crates/hearth-store", "crates/hearth-pull", "crates/hearth-api", "crates/hearth-serve", "crates/hearth-node", "crates/hearth-py"]
 
 [workspace.package]
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/aiassistsecure/hearth"

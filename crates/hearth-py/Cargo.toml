@@ -14,7 +14,7 @@ name = "_hearth"
 crate-type = ["cdylib"]
 
 [dependencies]
-hearth-core = { path = "../hearth-core", version = "0.4.3" }
+hearth-core = { path = "../hearth-core", version = "0.4.4" }
 # abi3-py39: ONE wheel per platform covers every Python from 3.9 up, instead
 # of a separate build per minor version. Fewer artifacts, and a user on a
 # Python we never built for still gets a binary instead of a compiler error.

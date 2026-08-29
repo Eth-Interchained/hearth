@@ -78,6 +78,79 @@ pub fn blob_path(blobs_dir: &Path, digest: &str) -> PathBuf {
     blobs_dir.join(format!("sha256-{}", sha256::normalize(digest)))
 }
 
+/// Bytes as something a person can compare to a download page.
+pub fn human_bytes(n: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let f = n as f64;
+    if f >= GIB {
+        format!("{:.2} GiB", f / GIB)
+    } else if f >= MIB {
+        format!("{:.1} MiB", f / MIB)
+    } else {
+        format!("{n} B")
+    }
+}
+
+/// Hash a file, showing that it is still working.
+///
+/// The step this replaces was a bare `sha256::hex_digest_file`, which on a
+/// 35 GiB blob is minutes of total silence immediately after curl prints
+/// `100.0%`. That is the exact failure `PullConfig::progress` was written to
+/// prevent, and the verify step was the one place the pull path did not honour
+/// it.
+///
+/// Throttled to roughly twice a second on one rewritten line, so it reads like
+/// the transfer meter above it instead of scrolling a wall of text.
+fn digest_file_loud(path: &Path, label: &str, progress: bool) -> Result<String, String> {
+    use std::io::Write;
+    let started = std::time::Instant::now();
+    let mut last = std::time::Instant::now();
+    let digest = sha256::hex_digest_file_with_progress(path, |done, total| {
+        if !progress {
+            return;
+        }
+        if last.elapsed() < std::time::Duration::from_millis(500) && done < total {
+            return;
+        }
+        last = std::time::Instant::now();
+        let secs = started.elapsed().as_secs_f64().max(0.001);
+        let rate = (done as f64 / secs) as u64;
+        let pct = if total > 0 {
+            format!("{:5.1}%", done as f64 / total as f64 * 100.0)
+        } else {
+            "  ?  ".to_string()
+        };
+        // \r, not \n: one line, rewritten in place.
+        let _ = write!(
+            std::io::stderr(),
+            "\rhearth: verifying {label} {pct} ({} / {}) {}/s   ",
+            human_bytes(done),
+            human_bytes(total),
+            human_bytes(rate)
+        );
+        let _ = std::io::stderr().flush();
+    })
+    .map_err(|e| format!("could not hash {}: {e}", path.display()))?;
+    if progress {
+        let secs = started.elapsed().as_secs_f64();
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let rate = if secs > 0.0 {
+            (len as f64 / secs) as u64
+        } else {
+            0
+        };
+        let _ = writeln!(
+            std::io::stderr(),
+            "\rhearth: verified {label} — {} in {:.1}s ({}/s)      ",
+            human_bytes(len),
+            secs,
+            human_bytes(rate)
+        );
+    }
+    Ok(digest)
+}
+
 /// Fetch one blob to its content-addressed home, verifying the digest.
 ///
 /// Downloads to a `.partial` sibling and renames only after the digest
@@ -103,8 +176,7 @@ fn fetch_blob_verified(
     if final_path.exists() {
         let len = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
         if cfg.verify_existing {
-            let actual = sha256::hex_digest_file(&final_path)
-                .map_err(|e| format!("could not read {}: {e}", final_path.display()))?;
+            let actual = digest_file_loud(&final_path, &blob.name, cfg.progress)?;
             if !sha256::matches(digest, &actual) {
                 // On disk under a digest it does not have. Say so loudly and
                 // re-fetch rather than quietly serving the wrong weights.
@@ -133,8 +205,7 @@ fn fetch_blob_verified(
     let partial = final_path.with_extension("partial");
     download_to(&partial, blob, cfg)?;
 
-    let actual = sha256::hex_digest_file(&partial)
-        .map_err(|e| format!("could not hash {}: {e}", partial.display()))?;
+    let actual = digest_file_loud(&partial, &blob.name, cfg.progress)?;
     if !sha256::matches(digest, &actual) {
         // Delete it. Keeping a blob that failed verification is how a corrupt
         // download becomes a permanent, cached, corrupt download.
@@ -191,8 +262,7 @@ fn fetch_blob_self_verified(blob: &Blob, cfg: &PullConfig) -> Result<(PathBuf, u
 
     download_to(&partial, blob, cfg)?;
 
-    let actual = sha256::hex_digest_file(&partial)
-        .map_err(|e| format!("could not hash {}: {e}", partial.display()))?;
+    let actual = digest_file_loud(&partial, &blob.name, cfg.progress)?;
     let final_path = blob_path(&cfg.blobs_dir, &actual);
 
     if final_path.exists() {
@@ -272,6 +342,13 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
         )
         .map_err(|e| format!("could not record the pull: {e}"))?;
 
+    // Resolving is a network round trip against a registry that can be slow or
+    // rate-limited, and it produced no output at all — so the first thing the
+    // operator saw was a pause before any transfer had been announced.
+    if cfg.progress {
+        eprintln!("hearth: resolving {source} …");
+    }
+
     let fetched = registry::resolve_blobs(&reference).map_err(|e| {
         // The failure is worth recording too — "we tried and the registry said
         // no" is a different fact from "nobody ever tried".
@@ -285,10 +362,38 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
         e
     })?;
 
+    // Announce the PLAN before moving bytes. "1 file, 35.10 GiB" up front is
+    // the difference between a transfer the operator can wait out and one they
+    // assume is stuck; and on a multi-part model it is the only way to know
+    // that a meter reaching 100.0% is part one of three, not the end.
+    let n = fetched.blobs.len();
+    if cfg.progress {
+        let total: u64 = fetched.blobs.iter().map(|b| b.size_bytes).sum();
+        eprintln!(
+            "hearth: {n} file(s), {} to fetch — then a sha256 verify of each",
+            human_bytes(total)
+        );
+    }
+
     let mut weights: Option<(PathBuf, u64)> = None;
     let mut cached_all = true;
-    for blob in &fetched.blobs {
+    for (i, blob) in fetched.blobs.iter().enumerate() {
+        if cfg.progress {
+            eprintln!(
+                "hearth: [{}/{n}] {} ({})",
+                i + 1,
+                blob.name,
+                if blob.size_bytes > 0 {
+                    human_bytes(blob.size_bytes)
+                } else {
+                    "size unknown".to_string()
+                }
+            );
+        }
         let (path, len, cached) = fetch_blob(blob, cfg)?;
+        if cfg.progress && cached {
+            eprintln!("hearth: [{}/{n}] already on disk, skipped", i + 1);
+        }
         if !cached {
             cached_all = false;
         }
