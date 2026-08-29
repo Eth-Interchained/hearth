@@ -178,6 +178,31 @@ pub enum Resolved {
 mod tests {
     use super::*;
 
+    /// `HEARTH_LLAMA_SERVER` is process-wide, and `resolve_server` READS it
+    /// before anything else — so every test that calls `resolve_server` shares
+    /// state with every test that sets it, even the ones that never touch it.
+    ///
+    /// The comment that used to sit on the env test said the opposite:
+    /// "tests in this file do not race on this var because only this one
+    /// touches it." True of WRITERS, and irrelevant — the race is with the
+    /// READER. Rust runs a test binary's tests as parallel threads in ONE
+    /// process, so with unlucky scheduling
+    /// `resolution_order_lets_an_operators_cuda_build_win` observed the var
+    /// mid-set and got `Explicit(...)` where it asserted `Missing`. It failed
+    /// exactly that way in CI on the v0.4.4 tag, having passed on v0.4.3 with
+    /// identical code — which is what a scheduling race looks like from the
+    /// outside, and why the test was believed correct for two releases.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the lock and guarantee a clean slate. `into_inner` on poison
+    /// because a panic in one test must not cascade into "all the others
+    /// failed too", which hides the one that actually broke.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("HEARTH_LLAMA_SERVER");
+        g
+    }
+
     fn plat(os: Os, arch: Arch, nvidia: bool) -> Platform {
         Platform { os, arch, nvidia }
     }
@@ -228,7 +253,11 @@ mod tests {
 
     #[test]
     fn resolution_order_lets_an_operators_cuda_build_win() {
-        let dir = std::env::temp_dir().join("hearth-rt-test");
+        let _env = env_guard();
+        // Unique per process: a fixed shared name under temp_dir is the same
+        // class of hazard as the shared env var, one `cargo test` away from
+        // biting.
+        let dir = std::env::temp_dir().join(format!("hearth-rt-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         // Nothing anywhere: Missing, and the caller points at `hearth runtime`.
@@ -248,8 +277,9 @@ mod tests {
 
     #[test]
     fn the_explicit_env_var_beats_everything() {
-        // Set/removed around the assertion; tests in this file do not race on
-        // this var because only this one touches it.
+        // Holds ENV_LOCK for the whole set/read/remove window. Without it the
+        // window is visible to every other test that calls `resolve_server`.
+        let _env = env_guard();
         std::env::set_var("HEARTH_LLAMA_SERVER", "/opt/llama/llama-server");
         let r = resolve_server(Path::new("/nowhere"), true);
         std::env::remove_var("HEARTH_LLAMA_SERVER");
