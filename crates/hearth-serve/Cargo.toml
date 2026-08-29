@@ -13,10 +13,10 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
-hearth-core = { path = "../hearth-core", version = "0.4.2" }
-hearth-store = { path = "../hearth-store", version = "0.4.2" }
-hearth-pull = { path = "../hearth-pull", version = "0.4.2" }
-hearth-api = { path = "../hearth-api", version = "0.4.2" }
+hearth-core = { path = "../hearth-core", version = "0.4.3" }
+hearth-store = { path = "../hearth-store", version = "0.4.3" }
+hearth-pull = { path = "../hearth-pull", version = "0.4.3" }
+hearth-api = { path = "../hearth-api", version = "0.4.3" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
