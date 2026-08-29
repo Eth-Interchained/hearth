@@ -61,6 +61,17 @@ port 11434
 # production default; each slot costs KV cache.
 parallel 8
 
+# Context per slot. SET THIS. KV cache is ctx * parallel, so leaving it at 0
+# means "the model's full trained context" — 131072 on gpt-oss, 1048576 on
+# Kimi-Linear — multiplied by every slot above. A fleet at `parallel 8` with
+# no ctx once spent ~14 GiB on KV cache nothing had declared and took the card
+# down. 16384 is a sane production start; raise it once /residency shows real
+# headroom.
+ctx 16384
+
+# Requests the gateway will hold at once before answering 503. Default 64.
+# max_inflight 64
+
 # GPU layers: -1 = all (default). 0 = CPU only — choose it, never fall into it.
 # gpu_layers -1
 
@@ -74,19 +85,30 @@ read_conf() {
   [ -f "$CONF" ] || { write_template; exit 0; }
   MODELS=(); TOTAL_GIB=24; PORT="${HEARTH_PORT:-11434}"
   PARALLEL="${HEARTH_PARALLEL:-8}"; GPU_LAYERS="${HEARTH_GPU_LAYERS:-}"
+  CTX="${HEARTH_CTX:-}"; MAX_INFLIGHT="${HEARTH_MAX_INFLIGHT:-}"
   EXTRA=()
   while IFS= read -r line; do
     line="${line%%#*}"
     [ -z "${line// /}" ] && continue
     set -- $line
     case "$1" in
-      model)      MODELS+=("$2") ;;
-      total_gib)  TOTAL_GIB="$2" ;;
-      port)       PORT="$2" ;;
-      parallel)   PARALLEL="$2" ;;
-      gpu_layers) GPU_LAYERS="$2" ;;
-      extra)      shift; EXTRA+=("$@") ;;
-      *)          die "fleet.conf: unknown directive '$1'" ;;
+      model)        MODELS+=("$2") ;;
+      total_gib)    TOTAL_GIB="$2" ;;
+      port)         PORT="$2" ;;
+      parallel)     PARALLEL="$2" ;;
+      gpu_layers)   GPU_LAYERS="$2" ;;
+      # ctx WAS MISSING, AND IT IS THE KNOB THAT CAUSED THE INCIDENT.
+      # `parallel` was configurable here and `ctx` was not, but KV cache is
+      # the PRODUCT of the two: on 2026-08-28 a fleet at `parallel 8` with no
+      # explicit ctx spent ~14 GiB on KV cache nothing had declared and took
+      # the card down. The operator could configure the multiplier and not the
+      # multiplicand, and adding `ctx` to this file to fix it hit
+      # "unknown directive 'ctx'" — so the documented remedy was unreachable
+      # from the documented config surface.
+      ctx)          CTX="$2" ;;
+      max_inflight) MAX_INFLIGHT="$2" ;;
+      extra)        shift; EXTRA+=("$@") ;;
+      *)            die "fleet.conf: unknown directive '$1' (known: model, total_gib, port, parallel, ctx, max_inflight, gpu_layers, extra)" ;;
     esac
   done < "$CONF"
   [ "${#MODELS[@]}" -gt 0 ] || die "no models in $CONF — add 'model NAME=/path.gguf:GIB' lines"
@@ -105,6 +127,11 @@ cmd_up() {
 
   local args=(up --total-gib "$TOTAL_GIB" --port "$PORT" --parallel "$PARALLEL")
   [ -n "$GPU_LAYERS" ] && args+=(--gpu-layers "$GPU_LAYERS")
+  # Passed as a FLAG, not left to the inherited env. `hearth up` reads
+  # flag > env > default, and a fleet definition that only works because the
+  # invoking shell happened to export something is not standing state.
+  [ -n "$CTX" ] && args+=(--ctx "$CTX")
+  [ -n "$MAX_INFLIGHT" ] && args+=(--max-inflight "$MAX_INFLIGHT")
   local m
   for m in "${MODELS[@]}"; do args+=(--model "$m"); done
   [ "${#EXTRA[@]}" -gt 0 ] && args+=("${EXTRA[@]}")
