@@ -159,9 +159,43 @@ pub fn plan_from_ollama_manifest(
 /// notice. Descending from there through the K-quants, then the big ones.
 /// F16 is last on purpose — it is correct and almost always the wrong default,
 /// since it will not fit next to anything else on one card.
+///
+/// The block-float formats sit at the END deliberately. When a repo ships one
+/// it is usually the REFERENCE release (gpt-oss is published in MXFP4, not
+/// converted to it), so it must be selectable — but a repo carrying both an
+/// MXFP4 and a K-quant should still land on the K-quant, because MXFP4 has no
+/// native path on pre-Blackwell hardware and gets dequantized to compute.
+/// Putting them last means behaviour changes only for repos that previously
+/// had NO recognised quantization at all.
 pub const QUANT_PREFERENCE: &[&str] = &[
-    "Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_0", "Q4_0", "Q3_K_M", "F16",
+    "Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_0", "Q4_0", "Q3_K_M", "F16", "MXFP4",
+    "NVFP4", "MXFP8",
 ];
+
+/// Files that live in a GGUF repo but are not the model you serve.
+///
+/// A draft head for speculative decoding (`eagle3-*`), a vision projector
+/// (`mmproj-*`) and a LoRA adapter are all valid GGUF, and all far smaller
+/// than the weights — so a chooser that ranks by quantization name will
+/// cheerfully return one.
+///
+/// Observed on `ggml-org/gpt-oss-20b-GGUF`, which holds exactly three GGUFs:
+///
+/// ```text
+/// eagle3-gpt-oss-20b-Q8_0.gguf     0.92 GB   <- draft head
+/// eagle3-gpt-oss-20b-BF16.gguf     1.72 GB   <- draft head
+/// gpt-oss-20b-MXFP4.gguf          12.11 GB   <- THE MODEL
+/// ```
+///
+/// An unpinned pull resolved to the 0.92 GB draft head, because `Q8_0` is in
+/// `QUANT_PREFERENCE` and `MXFP4` was not even recognised. That download
+/// succeeds, verifies, loads, and serves a draft head as though it were
+/// gpt-oss-20b. Wrong weights that work are worse than a failure.
+pub fn is_auxiliary_gguf(path: &str) -> bool {
+    let stem = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    const MARKERS: &[&str] = &["eagle3", "draft", "mmproj", "lora", "vocab-only"];
+    MARKERS.iter().any(|m| stem.contains(m))
+}
 
 /// One file in a HuggingFace repo listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,16 +213,36 @@ pub fn pick_gguf(
     files: &[RepoFile],
     wanted: Option<&str>,
 ) -> Result<(Vec<RepoFile>, String, bool), ResolveError> {
-    let ggufs: Vec<&RepoFile> = files
+    let all_ggufs: Vec<&RepoFile> = files
         .iter()
         .filter(|f| f.path.to_ascii_lowercase().ends_with(".gguf"))
         .collect();
-    if ggufs.is_empty() {
+    if all_ggufs.is_empty() {
         return Err(err(
             "no .gguf files in this repo — hearth serves GGUF, so a repo of \
              safetensors needs converting first",
         ));
     }
+
+    // Drop draft heads, vision projectors and adapters before ranking. They
+    // are never the model being served, and being small they otherwise win on
+    // a quantization name the real weights do not carry.
+    //
+    // Falls back to the unfiltered list when filtering would leave nothing, so
+    // a repo containing ONLY auxiliary files still reports on what it has
+    // rather than claiming the repo is empty.
+    let ggufs: Vec<&RepoFile> = {
+        let primary: Vec<&RepoFile> = all_ggufs
+            .iter()
+            .copied()
+            .filter(|f| !is_auxiliary_gguf(&f.path))
+            .collect();
+        if primary.is_empty() {
+            all_ggufs.clone()
+        } else {
+            primary
+        }
+    };
 
     let available = available_quants(&ggufs);
 
@@ -290,9 +344,15 @@ pub fn quant_of(path: &str) -> Option<String> {
 
 /// Every quantization name we recognize, longest-match-wins at lookup.
 const KNOWN_QUANTS: &[&str] = &[
-    "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q3_K", "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q4_K",
-    "Q5_0", "Q5_1", "Q5_K_S", "Q5_K_M", "Q5_K", "Q6_K", "Q8_0", "IQ1_S", "IQ2_XXS", "IQ2_XS",
-    "IQ3_XXS", "IQ3_XS", "IQ4_XS", "IQ4_NL", "F16", "FP16", "BF16", "F32",
+    "Q2_K", "Q2_K_L", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q3_K_XL", "Q3_K", "Q4_0", "Q4_1", "Q4_K_S",
+    "Q4_K_M", "Q4_K_L", "Q4_K_XL", "Q4_K", "Q5_0", "Q5_1", "Q5_K_S", "Q5_K_M", "Q5_K_L", "Q5_K",
+    "Q6_K_L", "Q6_K", "Q8_K", "Q8_0", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M",
+    "IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ3_M", "IQ4_XS", "IQ4_NL", "TQ1_0", "TQ2_0",
+    // Block-float formats. MXFP4 is not a community repack: gpt-oss is
+    // PUBLISHED in it, so a resolver that does not know the name cannot pull
+    // the reference weights at all -- `@MXFP4` failed with "no MXFP4 in this
+    // repo" while `gpt-oss-20b-MXFP4.gguf` sat in the listing.
+    "MXFP4", "MXFP8", "NVFP4", "FP8", "F16", "FP16", "BF16", "F32",
 ];
 
 /// Is `needle` present in `hay` as a whole token rather than a substring?
