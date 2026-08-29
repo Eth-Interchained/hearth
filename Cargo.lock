@@ -403,7 +403,7 @@ checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "hearth-api"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hearth-core",
  "serde_json",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-core"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-node"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hearth-core",
  "napi",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-pull"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hearth-core",
  "hearth-resolve",
@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-py"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hearth-core",
  "pyo3",
@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-resolve"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-serve"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hearth-api",
  "hearth-core",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-store"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hearth-core",
  "nedb-engine",

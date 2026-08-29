@@ -44,12 +44,20 @@ alive() {
 write_template() {
   mkdir -p "$HEARTH_HOME"
   cat > "$CONF" <<'EOF'
-# hearth fleet — one model per line:  NAME=/absolute/path/to.gguf:GIB
+# hearth fleet — one model per line:  NAME=/absolute/path/to.gguf:GIB[@CTX]
 # Declaration order IS priority order: first fit, never best fit.
 # Lines starting with # are ignored.
 #
 # model muse=/models/muse.gguf:20
 # model deepseek-r1:32b=/models/deepseek.gguf:20
+#
+# @CTX overrides the fleet-wide `ctx` below FOR THAT MODEL ONLY. Use it when a
+# fleet mixes context sizes: one number cannot be right for both a 1M-context
+# model and an 8B, and the KV budget is computed per model from whichever
+# applies.
+#
+# model kimi=/models/kimi.gguf:35@65536
+# model gpt-oss:20b=/models/gpt-oss.gguf:12@32768
 
 # The card, in GiB. hearth refuses at declare time what will not fit.
 total_gib 24

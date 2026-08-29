@@ -559,7 +559,7 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
     let specs = collect_models(args)?;
     if specs.is_empty() {
         return Err(
-            "usage: hearth up --model NAME=/path/to.gguf[:GIB] [--model …] \
+            "usage: hearth up --model NAME=/path/to.gguf[:GIB][@CTX] [--model …] \
                     [--port 11434] [--total-gib 48]"
                 .into(),
         );
@@ -597,12 +597,14 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
     };
     // Declaration order IS priority order. The operator listed these in the
     // order that matters to them; first fit, never best fit.
+    // The PLANNER must see the same ctx the child will actually run with, or
+    // it budgets KV for a context nobody uses — in either direction.
     let declared: Vec<Declared> = specs
         .iter()
-        .map(|(name, gguf_path, gib)| Declared {
-            model: name.clone(),
-            weights_bytes: gib * GIB,
-            kv_bytes: kv_bytes_for_model(gguf_path, ctx, parallel),
+        .map(|s| Declared {
+            model: s.name.clone(),
+            weights_bytes: s.gib * GIB,
+            kv_bytes: kv_bytes_for_model(&s.gguf, s.ctx.unwrap_or(ctx), parallel),
         })
         .collect();
 
@@ -614,10 +616,11 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
     // silently not existing.
     let log_dir = hearth_home().join("logs");
     std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
-    for (name, gguf, _) in &specs {
+    for ms in &specs {
+        let name = &ms.name;
         let port = free_port()?;
-        let mut spec = ServerSpec::new(name, gguf, port);
-        spec.ctx = ctx;
+        let mut spec = ServerSpec::new(name, &ms.gguf, port);
+        spec.ctx = ms.ctx.unwrap_or(ctx);
         spec.parallel = parallel;
         spec.gpu_layers = gpu_layers;
         spec.mlock = mlock;
@@ -635,8 +638,23 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
                 spec.binary.display()
             ));
         }
+        // Say the ctx THIS model got. With per-model ctx the one-line banner
+        // below can only report the default, and a fleet where the banner says
+        // 150000 while a model is actually running 32768 is a banner that
+        // misleads exactly when it matters.
+        let eff_ctx = spec.ctx;
         match sup.lock().unwrap().start(spec) {
-            Ok(()) => eprintln!("hearth: {name} loading on 127.0.0.1:{port} …"),
+            Ok(()) => {
+                let ctx_note = if eff_ctx == 0 {
+                    "ctx runtime default".to_string()
+                } else {
+                    format!(
+                        "ctx {eff_ctx} across {parallel} slot(s) = {}/request",
+                        eff_ctx / parallel.max(1)
+                    )
+                };
+                eprintln!("hearth: {name} loading on 127.0.0.1:{port} — {ctx_note} …");
+            }
             // A refusal is not a crash. Say it and keep going: the rest of the
             // fleet is still worth serving.
             Err(e) => eprintln!("hearth: {name} not started — {e}"),
@@ -661,7 +679,7 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
         }
         named
     };
-    let declared_names: Vec<String> = specs.iter().map(|(n, _, _)| n.clone()).collect();
+    let declared_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
     for unknown in hearth_serve::warmup::unknown_targets(&declared_names, &preload_named) {
         // A typo that silently warms nothing is a cold model discovered by
         // the first user of the day. Loud, not fatal.
@@ -886,17 +904,70 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
 /// The size is what the budget plans against. Without it we guess 4 GiB, which
 /// is deliberately conservative: over-guessing refuses models that would fit,
 /// and that is a worse failure than admitting one that is slightly tight.
-fn collect_models(args: &[String]) -> Result<Vec<(String, String, u64)>, String> {
+/// `--model NAME=/path/to.gguf[:GIB][@CTX]`
+///
+/// PER-MODEL CONTEXT, BECAUSE ONE GLOBAL `--ctx` IS THE WRONG SHAPE.
+///
+/// `--ctx` is a single value stamped onto every child in the start loop, and
+/// KV cache is computed from it per model — so a fleet mixing a 1M-context
+/// Kimi-Linear with an 8B granite had to pick ONE number for both. Pick it for
+/// the big model and the small one wastes the card; pick it for the small one
+/// and the big one is pointlessly clamped. On a 48 GiB card with three models
+/// that is the difference between all three resident and one refused.
+///
+/// `@CTX` is optional and falls back to the global `--ctx`, so every existing
+/// invocation means exactly what it meant before.
+///
+/// `@` rather than a third colon: `:GIB:CTX` would be two bare positional
+/// numbers whose order you have to remember, and it would collide with the
+/// digits-only test that keeps a Windows drive letter from being read as a
+/// size. `@` cannot appear in either field.
+/// One `--model` spec, parsed. A named struct rather than a tuple because the
+/// fourth field made the tuple genuinely hard to read at the call sites — and
+/// `gib`/`ctx` are both numbers, so positional access is exactly where a
+/// silent mix-up would live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelSpec {
+    name: String,
+    gguf: String,
+    gib: u64,
+    /// `None` inherits the fleet-wide `--ctx`.
+    ctx: Option<u32>,
+}
+
+fn collect_models(args: &[String]) -> Result<Vec<ModelSpec>, String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--model" {
             let spec = args
                 .get(i + 1)
-                .ok_or("--model needs NAME=/path/to.gguf[:GIB]")?;
-            let (name, rest) = spec
-                .split_once('=')
-                .ok_or_else(|| format!("--model {spec}: expected NAME=/path/to.gguf[:GIB]"))?;
+                .ok_or("--model needs NAME=/path/to.gguf[:GIB][@CTX]")?;
+            let (name, rest) = spec.split_once('=').ok_or_else(|| {
+                format!("--model {spec}: expected NAME=/path/to.gguf[:GIB][@CTX]")
+            })?;
+            // Context first, off the right: it is the only field introduced by
+            // '@', so taking it before the size keeps the size parsing below
+            // byte-for-byte what it was.
+            let (rest, ctx) = match rest.rsplit_once('@') {
+                Some((r, c)) if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) => {
+                    let parsed: u32 = c
+                        .parse()
+                        .map_err(|e| format!("--model {spec}: context {c}: {e}"))?;
+                    if parsed == 0 {
+                        return Err(format!(
+                            "--model {spec}: @0 is not a context — omit @CTX to inherit --ctx"
+                        ));
+                    }
+                    (r, Some(parsed))
+                }
+                Some((_, c)) => {
+                    return Err(format!(
+                        "--model {spec}: expected digits after '@', got {c:?}"
+                    ))
+                }
+                None => (rest, None),
+            };
             // Split the size off the RIGHT, so a Windows path's drive colon is
             // not mistaken for a size separator.
             let (path, gib) = match rest.rsplit_once(':') {
@@ -908,7 +979,12 @@ fn collect_models(args: &[String]) -> Result<Vec<(String, String, u64)>, String>
             if name.is_empty() || path.is_empty() {
                 return Err(format!("--model {spec}: name and path are both required"));
             }
-            out.push((name.to_string(), path.to_string(), gib));
+            out.push(ModelSpec {
+                name: name.to_string(),
+                gguf: path.to_string(),
+                gib,
+                ctx,
+            });
             i += 2;
         } else {
             i += 1;
@@ -1127,5 +1203,94 @@ fn cmd_verify() -> Result<(), String> {
             "verify FAILED — {} of {checked} nodes corrupt: {failures:?}",
             failures.len()
         ))
+    }
+}
+
+#[cfg(test)]
+mod model_spec_tests {
+    use super::collect_models;
+
+    fn m(spec: &str) -> Vec<super::ModelSpec> {
+        collect_models(&["--model".to_string(), spec.to_string()]).expect("should parse")
+    }
+
+    #[test]
+    fn per_model_ctx_is_read_and_the_size_still_is_too() {
+        let out = m("gpt-oss:20b=/blobs/sha256-27cd:12@32768");
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].name, "gpt-oss:20b",
+            "a colon in the NAME is not a size"
+        );
+        assert_eq!(out[0].gguf, "/blobs/sha256-27cd");
+        assert_eq!(out[0].gib, 12);
+        assert_eq!(out[0].ctx, Some(32768));
+    }
+
+    #[test]
+    fn omitting_ctx_inherits_the_global_one() {
+        // THE BACK-COMPAT GUARD. Every fleet.conf written before @CTX existed
+        // must mean exactly what it meant, or an upgrade silently reshapes a
+        // production fleet's KV budget.
+        let out = m("muse-local:latest=/blobs/sha256-71b5:12");
+        assert_eq!(out[0].name, "muse-local:latest");
+        assert_eq!(out[0].gib, 12);
+        assert_eq!(
+            out[0].ctx, None,
+            "None is what makes the global --ctx apply"
+        );
+    }
+
+    #[test]
+    fn ctx_without_a_size_works_and_the_size_defaults() {
+        let out = m("small=/blobs/sha256-aaa@8192");
+        assert_eq!(out[0].gguf, "/blobs/sha256-aaa");
+        assert_eq!(out[0].gib, 4, "documented default when :GIB is absent");
+        assert_eq!(out[0].ctx, Some(8192));
+    }
+
+    #[test]
+    fn a_windows_drive_colon_is_still_not_a_size() {
+        let out = m(r"win=C:\models\m.gguf:20@16384");
+        assert_eq!(out[0].gguf, r"C:\models\m.gguf");
+        assert_eq!(out[0].gib, 20);
+        assert_eq!(out[0].ctx, Some(16384));
+    }
+
+    #[test]
+    fn a_mixed_fleet_keeps_each_models_own_ctx() {
+        let args: Vec<String> = [
+            "--model",
+            "kimi=/blobs/a:35@65536",
+            "--model",
+            "granite=/blobs/b:9",
+            "--model",
+            "gpt-oss:20b=/blobs/c:12@32768",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = collect_models(&args).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].ctx, Some(65536));
+        assert_eq!(out[1].ctx, None, "inherits the global default");
+        assert_eq!(out[2].ctx, Some(32768));
+    }
+
+    #[test]
+    fn a_nonsense_ctx_is_refused_rather_than_silently_ignored() {
+        // Silently dropping "@abc" would budget KV for the global ctx while
+        // the operator believed they had pinned one.
+        assert!(collect_models(&["--model".into(), "x=/p:12@abc".into()]).is_err());
+        // @0 is ambiguous: it is the sentinel for "runtime default" internally,
+        // so accepting it would mean two spellings of the same thing.
+        assert!(collect_models(&["--model".into(), "x=/p:12@0".into()]).is_err());
+    }
+
+    #[test]
+    fn name_and_path_are_both_still_required() {
+        assert!(collect_models(&["--model".into(), "=/p:12".into()]).is_err());
+        assert!(collect_models(&["--model".into(), "n=".into()]).is_err());
+        assert!(collect_models(&["--model".into(), "no-equals-sign".into()]).is_err());
     }
 }
