@@ -134,6 +134,14 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          # Native arm64 runner, not cross-compilation: GitHub's arm runners
+          # are free for public repos, and a native build needs no cross
+          # linker setup to silently misconfigure. PyPI has shipped an
+          # aarch64 wheel since the wheels matrix gained its row — npm
+          # lacking the same platform meant `pip install` worked on a
+          # Graviton/Jetson box while `npm i @interchained/hearth` could not
+          # find a binding for the very same release.
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
           - { os: macos-latest,   target: x86_64-apple-darwin }
           - { os: macos-latest,   target: aarch64-apple-darwin }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }

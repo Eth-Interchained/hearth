@@ -1,7 +1,7 @@
 {
   "name": "@interchained/hearth",
   "version": "0.4.6",
-  "description": "Deterministic model residency \u2014 keep declared models warm, and tell the truth about which ones are.",
+  "description": "Deterministic model residency — keep declared models warm, and tell the truth about which ones are.",
   "license": "BUSL-1.1",
   "repository": {
     "type": "git",
@@ -20,6 +20,7 @@
       "defaults": false,
       "additional": [
         "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
         "x86_64-apple-darwin",
         "aarch64-apple-darwin",
         "x86_64-pc-windows-msvc"
