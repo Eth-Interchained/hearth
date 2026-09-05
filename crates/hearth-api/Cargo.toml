@@ -13,5 +13,5 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
-hearth-core = { path = "../hearth-core", version = "0.4.6" }
+hearth-core = { path = "../hearth-core", version = "0.4.7" }
 serde_json = { workspace = true }
