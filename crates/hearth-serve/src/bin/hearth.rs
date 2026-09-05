@@ -556,6 +556,15 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
 /// this card is a 409, because a retryable status there is a router hammering a
 /// box that is arithmetically incapable of answering.
 fn cmd_up(args: &[String]) -> Result<(), String> {
+    // Everything after a bare `--` belongs to llama-server, not to hearth.
+    // This is the ONLY route by which an operator reaches the runtime's own
+    // knobs — `-ub`, `--cache-reuse`, `-fa`, `--metrics`. Before this split
+    // existed, `hearth up` read its known flags and silently ignored the rest,
+    // so fleet.conf's documented `extra` directive was a no-op: the flags were
+    // parsed by start.sh, appended to hearth's argv, and dropped on the floor.
+    // Found by `ps -ww -eo args | grep llama-server` on a production box whose
+    // fleet.conf said `extra --jinja` and whose children had no `--jinja`.
+    let (args, passthrough) = split_passthrough(args);
     let specs = collect_models(args)?;
     if specs.is_empty() {
         return Err(
@@ -624,6 +633,10 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
         spec.parallel = parallel;
         spec.gpu_layers = gpu_layers;
         spec.mlock = mlock;
+        // Operator's runtime args, verbatim and last, so they can override any
+        // default argv() emits. Fleet-wide: one llama-server flag set for every
+        // child, the same way ctx/parallel are.
+        spec.extra_args = passthrough.to_vec();
         spec.binary = match flag(args, "--binary") {
             Some(b) => b.into(),
             None => default_binary()?,
@@ -935,6 +948,17 @@ struct ModelSpec {
     ctx: Option<u32>,
 }
 
+/// Split argv at the first bare `--`: hearth's own flags on the left, the
+/// runtime's on the right. Pure so the contract can be asserted without a
+/// fleet. A missing `--` means no passthrough — never a guess about which
+/// unknown flags "look like" llama-server's.
+fn split_passthrough(args: &[String]) -> (&[String], &[String]) {
+    match args.iter().position(|a| a == "--") {
+        Some(i) => (&args[..i], &args[i + 1..]),
+        None => (args, &[]),
+    }
+}
+
 fn collect_models(args: &[String]) -> Result<Vec<ModelSpec>, String> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -1203,6 +1227,63 @@ fn cmd_verify() -> Result<(), String> {
             "verify FAILED — {} of {checked} nodes corrupt: {failures:?}",
             failures.len()
         ))
+    }
+}
+
+#[cfg(test)]
+mod passthrough_tests {
+    use super::split_passthrough;
+
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn everything_after_the_separator_is_the_runtimes() {
+        let args = v(&[
+            "--model",
+            "m=/m.gguf:20",
+            "--parallel",
+            "2",
+            "--",
+            "--cache-reuse",
+            "256",
+            "-ub",
+            "2048",
+        ]);
+        let (own, rt) = split_passthrough(&args);
+        assert_eq!(own, &v(&["--model", "m=/m.gguf:20", "--parallel", "2"])[..]);
+        assert_eq!(rt, &v(&["--cache-reuse", "256", "-ub", "2048"])[..]);
+    }
+
+    #[test]
+    fn no_separator_means_no_passthrough_not_a_guess() {
+        // `--cache-reuse` is unknown to hearth, but without `--` it is NOT
+        // forwarded. Silently forwarding unknown flags would turn a typo in a
+        // hearth flag into a llama-server crash at spawn.
+        let args = v(&["--model", "m=/m.gguf:20", "--cache-reuse", "256"]);
+        let (own, rt) = split_passthrough(&args);
+        assert_eq!(own.len(), 4);
+        assert!(rt.is_empty());
+    }
+
+    #[test]
+    fn a_hearth_flag_after_the_separator_belongs_to_the_runtime() {
+        // `--port` after `--` is llama-server's --port, not hearth's. hearth
+        // owns the child port; an operator who passes it through gets exactly
+        // what they asked for, appended last where argv() lets it win.
+        let args = v(&["--port", "11434", "--", "--port", "9"]);
+        let (own, rt) = split_passthrough(&args);
+        assert_eq!(own, &v(&["--port", "11434"])[..]);
+        assert_eq!(rt, &v(&["--port", "9"])[..]);
+    }
+
+    #[test]
+    fn only_the_first_separator_splits() {
+        let args = v(&["--", "-c", "--", "x"]);
+        let (own, rt) = split_passthrough(&args);
+        assert!(own.is_empty());
+        assert_eq!(rt, &v(&["-c", "--", "x"])[..]);
     }
 }
 

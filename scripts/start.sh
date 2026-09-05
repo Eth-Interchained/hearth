@@ -83,8 +83,13 @@ ctx 16384
 # GPU layers: -1 = all (default). 0 = CPU only — choose it, never fall into it.
 # gpu_layers -1
 
-# Extra args passed to llama-server verbatim, e.g. a chat template:
-# extra --jinja
+# Extra args passed to llama-server verbatim, fleet-wide, appended LAST so
+# they override hearth's defaults. Time-to-first-token knobs live here:
+#   -ub 2048           bigger physical prefill batch (default 512)
+#   --cache-reuse 256  reuse a cached KV prefix by shifting, not re-prefill
+#   -fa on             flash attention (default auto)
+#   --metrics          prometheus /metrics per child
+# extra -ub 2048 --cache-reuse 256 -fa on --metrics
 EOF
   say "wrote a template to $CONF — fill in your models and run '$0 up' again"
 }
@@ -142,7 +147,11 @@ cmd_up() {
   [ -n "$MAX_INFLIGHT" ] && args+=(--max-inflight "$MAX_INFLIGHT")
   local m
   for m in "${MODELS[@]}"; do args+=(--model "$m"); done
-  [ "${#EXTRA[@]}" -gt 0 ] && args+=("${EXTRA[@]}")
+  # `extra` goes to llama-server, and the ONLY way it gets there is after a
+  # bare `--`. Appending it to hearth's own flags (what this line did before)
+  # made `hearth up` silently ignore every token: fleet.conf said
+  # `extra --jinja`, the children ran without it, and nothing said so.
+  [ "${#EXTRA[@]}" -gt 0 ] && args+=(-- "${EXTRA[@]}")
 
   # The keeper: run the gateway, and if it CRASHES, restart it after a pause.
   # A clean exit (SIGTERM from `down`, exit 0) is respected — a supervisor
