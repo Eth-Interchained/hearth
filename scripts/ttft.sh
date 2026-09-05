@@ -33,9 +33,9 @@ for s in json.load(sys.stdin).get("models",[]):
 [ -n "$ENDPOINT" ] || { echo "ttft: $MODEL has no endpoint in /residency (not ready, or not declared)" >&2; exit 1; }
 
 # A deterministic prompt of roughly TOKENS tokens: numbered lines tokenize at a
-# stable ~4 tokens each, so the SAME text is sent every run — that is the point.
+# stable ~7 tokens each (measured: 2000 -> 3360 at //4, so //7), so the SAME text is sent every run — that is the point.
 PROMPT="$(python3 -c 'import sys
-n=int(sys.argv[1])//4
+n=int(sys.argv[1])//7
 print("Read the following and answer: what is line 7?\n"+"\n".join(f"line {i}: alpha beta gamma" for i in range(n)))' "$TOKENS")"
 BODY="$(python3 -c 'import sys,json
 print(json.dumps({"prompt":sys.stdin.read(),"n_predict":1,"cache_prompt":True,"temperature":0}))' <<<"$PROMPT")"
