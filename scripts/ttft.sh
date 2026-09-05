@@ -44,21 +44,25 @@ timing() { # $1 = base url
   curl -s "$1/completion" -H 'content-type: application/json' -d "$BODY" \
   | python3 -c 'import sys,json
 d=json.load(sys.stdin); t=d.get("timings",{})
-print(f"{t.get(\"prompt_n\",0)} {t.get(\"prompt_ms\",0):.0f} {t.get(\"cache_n\",0)}")'
+print(t.get("prompt_n",0), round(t.get("prompt_ms",0)), t.get("cache_n",0))'
 }
 
+now_ms() { python3 -c 'import time;print(round(time.time()*1000))'; }
+GW_BODY="$(python3 -c 'import sys,json
+b=json.loads(sys.stdin.read()); b["model"]=sys.argv[1]; b["max_tokens"]=1; del b["n_predict"]; print(json.dumps(b))' "$MODEL" <<<"$BODY")"
+
 printf '%s  endpoint %s  ~%s prompt tokens\n' "$MODEL" "$ENDPOINT" "$TOKENS"
-printf '%-4s %-9s %-10s %-7s %-11s\n' run direct_ms prompt_n cached gateway_ms
+printf '%-4s %-10s %-9s %-7s %-12s %-12s\n' run prompt_ms prompt_n cached direct_wall gateway_wall
 i=1
 while [ "$i" -le "$RUNS" ]; do
-  read -r pn pms cn <<<"$(timing "http://$ENDPOINT")"
-  # Gateway path: wall clock around the same request via 11434, minus the
-  # direct prefill just measured. What is left is routing + proxy + queueing.
-  t0=$(python3 -c 'import time;print(time.time())')
-  curl -s "http://127.0.0.1:$PORT/v1/completions" -H 'content-type: application/json' \
-    -d "$(python3 -c 'import sys,json
-b=json.loads(sys.stdin.read()); b["model"]=sys.argv[1]; b["max_tokens"]=1; del b["n_predict"]; print(json.dumps(b))' "$MODEL" <<<"$BODY")" >/dev/null
-  gw=$(python3 -c 'import sys,time;print(f"{(time.time()-float(sys.argv[1]))*1000-float(sys.argv[2]):.0f}")' "$t0" "$pms")
-  printf '%-4s %-9s %-10s %-7s %-11s\n' "$i" "$pms" "$pn" "$cn" "$gw"
+  # Direct to the child: prompt_ms/cache_n are llama-server's own numbers.
+  t0=$(now_ms); read -r pn pms cn <<<"$(timing "http://$ENDPOINT")"; t1=$(now_ms)
+  # Same request through hearth's gateway. Both walls are client clocks around
+  # an identical request, so the gap between them is routing + proxy + queueing.
+  # Read it off runs 2+, where BOTH sides are cache-warm — on run 1 the direct
+  # call is cold and the gateway call is warm, and the gap would be a lie.
+  curl -s "http://127.0.0.1:$PORT/v1/completions" -H 'content-type: application/json' -d "$GW_BODY" >/dev/null
+  t2=$(now_ms)
+  printf '%-4s %-10s %-9s %-7s %-12s %-12s\n' "$i" "$pms" "$pn" "$cn" "$((t1-t0))" "$((t2-t1))"
   i=$((i+1))
 done
