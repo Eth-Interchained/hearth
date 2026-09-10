@@ -59,6 +59,26 @@ write_template() {
 # model kimi=/models/kimi.gguf:35@65536
 # model gpt-oss:20b=/models/gpt-oss.gguf:12@32768
 
+# Which GPUs one model may see — placement on a MULTI-CARD box.
+#
+#   devices GLM-4-32B=0,1,2
+#   devices llama3:8b=3
+#
+# Say nothing and every child sees every card, which is llama.cpp's own
+# behaviour and the right default on one GPU. On a mixed fleet it is not:
+# llama-server spreads a model proportionally across everything visible, so on
+# a 4xV100 box an 8B that fits on ONE card was found holding ~2.8 GiB on each
+# of three — paying a PCIe hop per layer boundary for nothing, and taking
+# 8.5 GiB of headroom from the 32B sharing those cards. Pinning the small one
+# to its own card gave the big one back the room for a larger prefill batch.
+#
+# A card named by no model is a card the fleet will not touch — that is how you
+# reserve one for a non-hearth tenant (TTS, another runtime) on the same host.
+#
+# NOTE: total_gib below is still ONE fleet-wide budget, not per device. With
+# pinning that is conservative, never optimistic: it can refuse a model that
+# would have fit on its own card.
+
 # The card, in GiB. hearth refuses at declare time what will not fit.
 total_gib 24
 
@@ -99,7 +119,7 @@ read_conf() {
   MODELS=(); TOTAL_GIB=24; PORT="${HEARTH_PORT:-11434}"
   PARALLEL="${HEARTH_PARALLEL:-8}"; GPU_LAYERS="${HEARTH_GPU_LAYERS:-}"
   CTX="${HEARTH_CTX:-}"; MAX_INFLIGHT="${HEARTH_MAX_INFLIGHT:-}"
-  EXTRA=()
+  EXTRA=(); DEVICES=()
   while IFS= read -r line; do
     line="${line%%#*}"
     [ -z "${line// /}" ] && continue
@@ -120,8 +140,12 @@ read_conf() {
       # from the documented config surface.
       ctx)          CTX="$2" ;;
       max_inflight) MAX_INFLIGHT="$2" ;;
+      # Which GPUs one model may see. Placement is not a llama-server flag —
+      # it is the environment the child is spawned into — so it cannot ride in
+      # `extra`, and `extra` is fleet-wide anyway.
+      devices)      DEVICES+=("$2") ;;
       extra)        shift; EXTRA+=("$@") ;;
-      *)            die "fleet.conf: unknown directive '$1' (known: model, total_gib, port, parallel, ctx, max_inflight, gpu_layers, extra)" ;;
+      *)            die "fleet.conf: unknown directive '$1' (known: model, devices, total_gib, port, parallel, ctx, max_inflight, gpu_layers, extra)" ;;
     esac
   done < "$CONF"
   [ "${#MODELS[@]}" -gt 0 ] || die "no models in $CONF — add 'model NAME=/path.gguf:GIB' lines"
@@ -147,6 +171,14 @@ cmd_up() {
   [ -n "$MAX_INFLIGHT" ] && args+=(--max-inflight "$MAX_INFLIGHT")
   local m
   for m in "${MODELS[@]}"; do args+=(--model "$m"); done
+  # Guarded, and the guard is load-bearing: under `set -u` on bash 3.2 (what
+  # macOS ships, which this script targets) expanding an EMPTY array is an
+  # unbound-variable error, so an unguarded loop here would break `up` for
+  # every fleet.conf that never mentions devices. `${#ARR[@]}` is safe there.
+  if [ "${#DEVICES[@]}" -gt 0 ]; then
+    local d
+    for d in "${DEVICES[@]}"; do args+=(--devices "$d"); done
+  fi
   # `extra` goes to llama-server, and the ONLY way it gets there is after a
   # bare `--`. Appending it to hearth's own flags (what this line did before)
   # made `hearth up` silently ignore every token: fleet.conf said

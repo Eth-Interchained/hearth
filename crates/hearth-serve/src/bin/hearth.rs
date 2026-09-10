@@ -566,12 +566,25 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
     // fleet.conf said `extra --jinja` and whose children had no `--jinja`.
     let (args, passthrough) = split_passthrough(args);
     let specs = collect_models(args)?;
+    let devices = collect_devices(args)?;
     if specs.is_empty() {
         return Err(
             "usage: hearth up --model NAME=/path/to.gguf[:GIB][@CTX] [--model …] \
-                    [--port 11434] [--total-gib 48]"
+                    [--devices NAME=0,1,2 …] [--port 11434] [--total-gib 48]"
                 .into(),
         );
+    }
+    // A placement for a model this fleet does not declare is a typo that
+    // otherwise costs nothing to make and everything to find: the model comes
+    // up on every card, exactly as if the line were not there. Loud, not
+    // fatal — the same call as an unknown --preload-model.
+    for (name, list) in &devices {
+        if !specs.iter().any(|s| &s.name == name) {
+            eprintln!(
+                "hearth: --devices {name}={list}: not declared on this fleet — ignoring \
+                 (it will NOT pin anything)"
+            );
+        }
     }
     let api_port: u16 = tunable(args, "--port", "HEARTH_PORT", 11434);
     let total_gib: u64 = flag(args, "--total-gib")
@@ -633,6 +646,11 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
         spec.parallel = parallel;
         spec.gpu_layers = gpu_layers;
         spec.mlock = mlock;
+        // Placement, per model, unset unless this fleet named it.
+        spec.devices = devices
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, list)| list.clone());
         // Operator's runtime args, verbatim and last, so they can override any
         // default argv() emits. Fleet-wide: one llama-server flag set for every
         // child, the same way ctx/parallel are.
@@ -656,6 +674,13 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
         // 150000 while a model is actually running 32768 is a banner that
         // misleads exactly when it matters.
         let eff_ctx = spec.ctx;
+        // Same reason the ctx note exists: a banner that reports the fleet's
+        // intent rather than THIS child's is a banner that misleads exactly
+        // when placement is what you are debugging.
+        let gpu_note = match &spec.devices {
+            Some(d) => format!(" · gpu {d}"),
+            None => String::new(),
+        };
         match sup.lock().unwrap().start(spec) {
             Ok(()) => {
                 let ctx_note = if eff_ctx == 0 {
@@ -666,7 +691,7 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
                         eff_ctx / parallel.max(1)
                     )
                 };
-                eprintln!("hearth: {name} loading on 127.0.0.1:{port} — {ctx_note} …");
+                eprintln!("hearth: {name} loading on 127.0.0.1:{port} — {ctx_note}{gpu_note} …");
             }
             // A refusal is not a crash. Say it and keep going: the rest of the
             // fleet is still worth serving.
@@ -736,6 +761,33 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
             format!("{ctx} shared across slots")
         },
     );
+    // Only what was ACTUALLY pinned. Listing an undeclared model here would
+    // contradict the "not declared — ignoring" warning printed seconds
+    // earlier, and a banner that disagrees with itself is worse than no
+    // banner: an operator scanning startup output would read the summary,
+    // believe the placement took, and go looking for the slowness elsewhere.
+    // Found by running it against a fake runtime with a deliberate typo.
+    let pinned: Vec<&(String, String)> = devices
+        .iter()
+        .filter(|(n, _)| specs.iter().any(|s| &s.name == n))
+        .collect();
+    if !pinned.is_empty() {
+        println!(
+            "  pinned: {}",
+            pinned
+                .iter()
+                .map(|(n, d)| format!("{n} → gpu {d}"))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        );
+        // Said out loud because it is the one thing this feature does NOT do.
+        // The planner's budget is one number for the whole fleet, so a pinned
+        // model is still counted against the same --total-gib as everything
+        // else. That is conservative (it can refuse a model that would have
+        // fit on its own card) and never optimistic, but an operator reading
+        // /residency deserves to know which number they are looking at.
+        println!("  note: --total-gib {total_gib} is still budgeted fleet-wide, not per device");
+    }
     println!("  POST /v1/chat/completions   routed by the \"model\" field");
     println!("  GET  /v1/models             what is declared, and what is ready");
     println!("  GET  /residency             the truth the OpenAI shape cannot carry");
@@ -1017,6 +1069,51 @@ fn collect_models(args: &[String]) -> Result<Vec<ModelSpec>, String> {
     Ok(out)
 }
 
+/// `--devices NAME=LIST`, repeatable: which GPUs each model may see.
+///
+/// Returns pairs in declaration order rather than a map, so the caller can
+/// report them in the order the operator wrote them.
+///
+/// Strict on purpose. A device list is spelled straight into
+/// `CUDA_VISIBLE_DEVICES`, where every wrong spelling fails SILENTLY and
+/// differently: `"0,,2"` is parsed by the CUDA driver up to the bad entry and
+/// the rest is dropped, so a model an operator believed was on three cards
+/// comes up on one and merely looks slow. An empty list is refused for the
+/// opposite reason — it is VALID and means "no GPU at all", which is a way to
+/// land on CPU inference by typo. `gpu_layers 0` says that on purpose.
+fn collect_devices(args: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for spec in flag_all(args, "--devices") {
+        let (name, list) = spec
+            .split_once('=')
+            .ok_or_else(|| format!("--devices {spec}: expected NAME=LIST (e.g. llama3:8b=3)"))?;
+        if name.is_empty() {
+            return Err(format!("--devices {spec}: a model name is required"));
+        }
+        if list.is_empty() {
+            return Err(format!(
+                "--devices {spec}: an empty device list means NO GPU — say that with `gpu_layers 0`"
+            ));
+        }
+        for part in list.split(',') {
+            if part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()) {
+                return Err(format!(
+                    "--devices {spec}: {part:?} is not a device index — expected digits \
+                     separated by commas (e.g. 0,1,2)"
+                ));
+            }
+        }
+        if out.iter().any(|(n, _)| n == name) {
+            return Err(format!(
+                "--devices {spec}: {name} already has a device list — one placement per model, \
+                 or the second silently wins"
+            ));
+        }
+        out.push((name.to_string(), list.to_string()));
+    }
+    Ok(out)
+}
+
 /// The KV cache a model at `ctx_flag`/`parallel` will actually allocate,
 /// read from its own GGUF header.
 ///
@@ -1284,6 +1381,85 @@ mod passthrough_tests {
         let (own, rt) = split_passthrough(&args);
         assert!(own.is_empty());
         assert_eq!(rt, &v(&["-c", "--", "x"])[..]);
+    }
+}
+
+#[cfg(test)]
+mod devices_tests {
+    use super::collect_devices;
+
+    fn d(args: &[&str]) -> Result<Vec<(String, String)>, String> {
+        collect_devices(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_mixed_fleet_pins_each_model_where_it_was_told() {
+        let out = d(&[
+            "--devices",
+            "GLM-4-32B=0,1,2",
+            "--model",
+            "GLM-4-32B=/blobs/a:33",
+            "--devices",
+            "llama3:8b=3",
+        ])
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                ("GLM-4-32B".to_string(), "0,1,2".to_string()),
+                // A colon in the NAME is not a separator here either.
+                ("llama3:8b".to_string(), "3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_devices_at_all_is_the_normal_case() {
+        // THE BACK-COMPAT GUARD. Every fleet.conf written before this existed
+        // must mean exactly what it meant: every child sees every card.
+        assert!(d(&["--model", "m=/m.gguf:20"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_empty_list_is_refused_because_it_is_valid_and_means_cpu() {
+        // CUDA_VISIBLE_DEVICES="" is not ignored by the driver — it hides
+        // every GPU. Accepting `devices m=` would be a way to land a 32B on
+        // the CPU by typo, which looks like broken hardware, not a config
+        // error. `gpu_layers 0` says it deliberately.
+        let err = d(&["--devices", "m="]).unwrap_err();
+        assert!(err.contains("gpu_layers 0"), "got: {err}");
+    }
+
+    #[test]
+    fn a_malformed_list_is_refused_rather_than_half_applied() {
+        // The CUDA driver parses up to the bad entry and drops the rest, so
+        // "0,,2" silently becomes "0" — a model an operator believed was on
+        // three cards comes up on one and merely looks slow.
+        assert!(d(&["--devices", "m=0,,2"]).is_err());
+        assert!(d(&["--devices", "m=0,x"]).is_err());
+        assert!(d(&["--devices", "m=gpu0"]).is_err());
+        assert!(d(&["--devices", "m=0-2"]).is_err());
+    }
+
+    #[test]
+    fn two_placements_for_one_model_is_an_error_not_a_race() {
+        // Last-wins would be a fleet.conf whose meaning depends on line order
+        // for one directive and not the others.
+        assert!(d(&["--devices", "m=0", "--devices", "m=1"]).is_err());
+    }
+
+    #[test]
+    fn name_and_list_are_both_required() {
+        assert!(d(&["--devices", "no-equals-sign"]).is_err());
+        assert!(d(&["--devices", "=0,1"]).is_err());
+    }
+
+    #[test]
+    fn the_equals_spelling_works_too() {
+        // flag_all accepts `--devices=X`; the fleet script writes the spaced
+        // form, a human debugging by hand often writes the other.
+        let out = d(&["--devices=m=0,1"]).unwrap();
+        assert_eq!(out, vec![("m".to_string(), "0,1".to_string())]);
     }
 }
 

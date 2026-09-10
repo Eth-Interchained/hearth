@@ -57,6 +57,25 @@ pub struct ServerSpec {
     /// Continuous batching. Only meaningful with more than one slot, and the
     /// reason parallel slots actually help instead of just interleaving.
     pub cont_batching: bool,
+    /// Which GPUs THIS child may see, as `CUDA_VISIBLE_DEVICES` (e.g. `"0,1,2"`
+    /// or `"3"`). `None` leaves the environment alone — every child sees every
+    /// card, which is llama.cpp's own behaviour.
+    ///
+    /// This exists because "all the cards" is the wrong answer for a MIXED
+    /// fleet. llama-server spreads a model proportionally across everything it
+    /// can see, so on a 4×V100 box an 8B that fits on one card was found
+    /// holding ~2.8 GiB on each of three of them — paying a PCIe host-bridge
+    /// hop per layer boundary for nothing, and taking 8.5 GiB of headroom away
+    /// from the 32B it was sharing them with. Neither `--parallel` nor
+    /// `--ctx` nor any amount of `extra` could express "put the small one over
+    /// there"; placement is not a llama-server flag, it is the environment the
+    /// child is spawned into.
+    ///
+    /// Pinning is also how a card gets RESERVED: a device named by no model is
+    /// a device the fleet will not touch, which is the only way to leave room
+    /// for a non-hearth tenant (a TTS process, another runtime) on the same
+    /// host.
+    pub devices: Option<String>,
     /// Extra args passed through verbatim, after ours.
     pub extra_args: Vec<String>,
     /// Directory for stdout/stderr capture files.
@@ -75,6 +94,7 @@ impl ServerSpec {
             gpu_layers: None,
             mlock: false,
             cont_batching: true,
+            devices: None,
             extra_args: Vec::new(),
             log_dir: std::env::temp_dir(),
         }
@@ -124,6 +144,37 @@ impl ServerSpec {
         args
     }
 
+    /// The environment we will actually set on the child — pure, for the same
+    /// reason `argv()` is: placement that only exists inside a spawn call is
+    /// placement no test can assert. Returns only the variables hearth SETS;
+    /// everything else is inherited.
+    ///
+    /// `ld_library_path` is the inherited value, passed in rather than read
+    /// here so this stays a function of its inputs.
+    pub fn child_env(&self, ld_library_path: &str) -> Vec<(String, String)> {
+        let mut env = Vec::new();
+        // A fetched runtime keeps its shared libraries next to the binary;
+        // without this, a prebuilt llama-server dies on ggml .so lookups and
+        // reads as "started, then died".
+        if let Some(dir) = self.binary.parent() {
+            if dir.components().count() > 0 {
+                let joined = if ld_library_path.is_empty() {
+                    dir.display().to_string()
+                } else {
+                    format!("{}:{ld_library_path}", dir.display())
+                };
+                env.push(("LD_LIBRARY_PATH".to_string(), joined));
+            }
+        }
+        // Placement. Set only when asked: an unconditional
+        // CUDA_VISIBLE_DEVICES would override an operator's own export for
+        // every fleet that never mentions devices at all.
+        if let Some(d) = &self.devices {
+            env.push(("CUDA_VISIBLE_DEVICES".to_string(), d.clone()));
+        }
+        env
+    }
+
     fn log_path(&self, stream: &str) -> PathBuf {
         // Model names can carry ':' and '/'; keep filenames boring.
         let safe: String = self
@@ -160,19 +211,9 @@ impl ServerChild {
         let stderr =
             std::fs::File::create(spec.log_path("err")).map_err(|e| format!("log file: {e}"))?;
         let mut cmd = Command::new(&spec.binary);
-        // A fetched runtime keeps its shared libraries next to the binary;
-        // without this, a prebuilt llama-server dies on ggml .so lookups and
-        // reads as "started, then died".
-        if let Some(dir) = spec.binary.parent() {
-            if dir.components().count() > 0 {
-                let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-                let joined = if existing.is_empty() {
-                    dir.display().to_string()
-                } else {
-                    format!("{}:{existing}", dir.display())
-                };
-                cmd.env("LD_LIBRARY_PATH", joined);
-            }
+        let inherited = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+        for (k, v) in spec.child_env(&inherited) {
+            cmd.env(k, v);
         }
         let child = cmd
             .args(spec.argv())
@@ -274,6 +315,60 @@ mod tests {
                 // The operator's own arguments last, so they win.
                 "-t",
                 "2"
+            ]
+        );
+    }
+
+    #[test]
+    fn placement_is_environment_not_argv() {
+        // The whole point: CUDA_VISIBLE_DEVICES is not a llama-server flag.
+        // If this ever leaks into argv, llama-server dies at spawn on an
+        // unknown argument — and it would read as "the runtime is broken".
+        let mut spec = ServerSpec::new("glm", "/models/glm.gguf", 8080);
+        spec.devices = Some("0,1,2".into());
+        assert!(!spec.argv().iter().any(|a| a.contains("CUDA")));
+        assert!(!spec.argv().iter().any(|a| a == "--devices"));
+        assert_eq!(
+            spec.child_env(""),
+            vec![("CUDA_VISIBLE_DEVICES".to_string(), "0,1,2".to_string())]
+        );
+    }
+
+    #[test]
+    fn no_devices_means_the_variable_is_left_alone() {
+        // NOT `CUDA_VISIBLE_DEVICES=""` — that means "no GPU" and would put
+        // every unpinned fleet on the CPU. And not an unconditional set of
+        // "all cards" either: an operator who exports the variable themselves
+        // for a fleet that never mentions devices must keep winning.
+        let spec = ServerSpec::new("glm", "/models/glm.gguf", 8080);
+        assert!(spec
+            .child_env("")
+            .iter()
+            .all(|(k, _)| k != "CUDA_VISIBLE_DEVICES"));
+    }
+
+    #[test]
+    fn the_runtimes_own_libraries_still_come_first() {
+        // Placement must not have displaced the LD_LIBRARY_PATH fix: a
+        // prebuilt llama-server dies on ggml .so lookups without it, and that
+        // failure reads as "started, then died".
+        let spec = ServerSpec::new("glm", "/models/glm.gguf", 8080);
+        assert!(
+            spec.child_env("").is_empty(),
+            "a bare binary name has no parent dir to add"
+        );
+
+        let mut spec = ServerSpec::new("glm", "/models/glm.gguf", 8080);
+        spec.binary = "/opt/llama/bin/llama-server".into();
+        spec.devices = Some("3".into());
+        assert_eq!(
+            spec.child_env("/usr/lib"),
+            vec![
+                (
+                    "LD_LIBRARY_PATH".to_string(),
+                    "/opt/llama/bin:/usr/lib".to_string()
+                ),
+                ("CUDA_VISIBLE_DEVICES".to_string(), "3".to_string()),
             ]
         );
     }
