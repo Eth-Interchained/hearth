@@ -39,6 +39,23 @@ hearth verify
 
 `hearth serve` flags: `--model` and `--gguf` are required; `--port`, `--ctx`, `--vram-gib`, `--total-gib`, `--binary` and `--once` are optional. `--once` starts, waits for ready, and exits — useful in CI, where supervising forever is the wrong shape.
 
+### Placement on a multi-GPU box
+
+```bash
+hearth up --model GLM-4-32B=/blobs/glm.gguf:33@16384 \
+          --model llama3:8b=/blobs/llama3.gguf:9@16384 \
+          --devices GLM-4-32B=0,1,2 \
+          --devices llama3:8b=3
+```
+
+`--devices NAME=LIST` (repeatable, `devices NAME=LIST` in `fleet.conf`) is spelled into that child's `CUDA_VISIBLE_DEVICES`. Say nothing and every child sees every card — llama.cpp's own behaviour, and the right default on one GPU.
+
+On a mixed fleet it is the wrong default. llama-server spreads a model proportionally across every visible card, so on a 4×V100 box an 8B that fits on **one** card was found holding ~2.8 GiB on each of three of them: paying a PCIe host-bridge hop per layer boundary for nothing, and taking 8.5 GiB of headroom away from the 32B it shared those cards with. That 8.5 GiB was the difference between a 128-token prefill batch and a 512-token one. No `extra` flag can express it, because placement is not an argument to llama-server — it is the environment the child is spawned into.
+
+Pinning is also how a card gets **reserved**: a device named by no model is a device the fleet will not touch, which is how a non-hearth tenant (a TTS process, another runtime) keeps its own GPU on a shared host.
+
+One limit, stated rather than discovered: `--total-gib` is still **one fleet-wide budget**, not per device. With pinning that is conservative and never optimistic — it can refuse a model that would have fit on its own card. Per-device budgeting is the follow-up.
+
 Point it at a llama.cpp build with `--binary` or `HEARTH_LLAMA_SERVER`; state lives in `$HEARTH_HOME` (default `~/.hearth`).
 
 ## As a library
