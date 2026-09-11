@@ -26,6 +26,8 @@ pub mod registry;
 pub mod runtime;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use hearth_core::sha256;
 use hearth_resolve::Reference;
@@ -369,6 +371,24 @@ fn download_to(dest: &Path, blob: &Blob, cfg: &PullConfig) -> Result<(), String>
 /// input order after finishing out of order.
 type FetchOutcome = (usize, PathBuf, u64, bool);
 
+/// Bytes currently sitting in `.partial` files in the blobs dir.
+///
+/// The heartbeat measures the DISK rather than the workers, because curl is a
+/// blocking subprocess this process cannot poll for progress. Any read error is
+/// treated as zero for that entry: a monitor thread must never be the thing
+/// that fails a download, and an undercount shows up as a conservative number
+/// rather than a crash.
+fn partial_bytes(blobs_dir: &Path) -> u64 {
+    let rd = match std::fs::read_dir(blobs_dir) {
+        Ok(rd) => rd,
+        Err(_) => return 0,
+    };
+    rd.flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
+        .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+        .sum()
+}
+
 fn fetch_blobs_parallel(
     blobs: &[Blob],
     cfg: &PullConfig,
@@ -392,7 +412,7 @@ fn fetch_blobs_parallel(
     // the workers emit a single completion line instead (see below). The outer
     // cfg.progress flag still governs whether ANY output is produced.
     let worker_cfg = if thread_count > 1 {
-        // Progress off inside workers; the completion banner below takes over.
+        // Progress off inside workers; the AGGREGATE HEARTBEAT below takes over.
         Arc::new(PullConfig {
             progress: false,
             ..cfg.clone()
@@ -414,12 +434,101 @@ fn fetch_blobs_parallel(
     let results: Arc<Mutex<Vec<FetchOutcome>>> =
         Arc::new(Mutex::new(Vec::with_capacity(blobs.len())));
 
+    // THE HEARTBEAT. This exists because suppressing per-part curl meters for
+    // readability produced TOTAL SILENCE, and hearth's own pull code already
+    // carried the warning I then walked straight into: "A silent multi-gigabyte
+    // pause is indistinguishable from a hang."
+    //
+    // Reported live on a real 271.79 GiB / 7-part GLM pull: part 1 was already
+    // on disk so it printed instantly, and then nothing at all while four
+    // workers moved a quarter of a terabyte. The operator correctly read that
+    // as a hang. Trading interleaved mush for no output is not an improvement;
+    // it is the same defect wearing better manners.
+    //
+    // So a monitor thread watches the FILESYSTEM rather than the workers —
+    // summing the `.partial` files in flight plus the parts already finished —
+    // and prints one aggregate line on a fixed interval. Watching the disk
+    // means it reports real progress even though curl is a blocking subprocess
+    // this process cannot poll.
+    let done_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let done_parts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let total_expected: u64 = blobs.iter().map(|b| b.size_bytes).sum();
+
     std::thread::scope(|s| {
+        if cfg.progress && thread_count > 1 {
+            let blobs_dir = cfg.blobs_dir.clone();
+            let done_bytes = Arc::clone(&done_bytes);
+            let done_parts = Arc::clone(&done_parts);
+            let stop = Arc::clone(&stop);
+            let n = blobs.len();
+            s.spawn(move || {
+                // Five seconds: frequent enough that a stalled transfer is
+                // obvious within one screen, sparse enough that an hours-long
+                // pull does not fill a terminal or a log file.
+                const EVERY: Duration = Duration::from_secs(5);
+                // Sleep in short slices so shutdown is prompt; one flat
+                // `sleep(EVERY)` would keep the process alive for up to a full
+                // interval after the last part landed, which reads as a hang at
+                // the very end. The slice count is DERIVED from EVERY so the
+                // interval is stated exactly once — the earlier version
+                // hard-coded 50 alongside it, which made EVERY dead code and
+                // the real cadence a coincidence of two numbers agreeing.
+                const SLICE: Duration = Duration::from_millis(100);
+                let slices = (EVERY.as_millis() / SLICE.as_millis()).max(1);
+                let every_secs = EVERY.as_secs();
+                let started = Instant::now();
+                let mut last = 0u64;
+                loop {
+                    for _ in 0..slices {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(SLICE);
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let in_flight = partial_bytes(&blobs_dir);
+                    let finished = done_bytes.load(Ordering::Relaxed);
+                    let have = finished + in_flight;
+                    let parts = done_parts.load(Ordering::Relaxed);
+                    let secs = started.elapsed().as_secs_f64().max(0.001);
+                    let rate = have as f64 / secs;
+                    // A rate of zero over a whole interval is the signal that
+                    // matters most, so it is stated rather than left to be
+                    // inferred from an unchanging byte count.
+                    let moved = have.saturating_sub(last);
+                    last = have;
+                    let of_total = if total_expected > 0 {
+                        format!(" / {}", human_bytes(total_expected))
+                    } else {
+                        String::new()
+                    };
+                    if moved == 0 {
+                        eprintln!(
+                            "hearth: {parts}/{n} parts · {}{of_total} · NO BYTES in the last \
+                             {every_secs}s — transfer may be stalled",
+                            human_bytes(have)
+                        );
+                    } else {
+                        eprintln!(
+                            "hearth: {parts}/{n} parts · {}{of_total} · {}/s",
+                            human_bytes(have),
+                            human_bytes(rate as u64)
+                        );
+                    }
+                }
+            });
+        }
+
         for _ in 0..thread_count {
             let next_idx = Arc::clone(&next_idx);
             let first_error = Arc::clone(&first_error);
             let results = Arc::clone(&results);
             let worker_cfg = Arc::clone(&worker_cfg);
+            let done_bytes = Arc::clone(&done_bytes);
+            let done_parts = Arc::clone(&done_parts);
 
             s.spawn(move || {
                 loop {
@@ -438,12 +547,43 @@ fn fetch_blobs_parallel(
                     }
 
                     let blob = &blobs[i];
+
+                    // ONE worker means the order is deterministic and the live
+                    // curl meter is still on, so announce each part BEFORE its
+                    // bytes move — a progress bar with no filename attached is
+                    // the regression this restores. In parallel mode the start
+                    // order is non-deterministic and N banners would interleave
+                    // with N in-flight transfers, so those parts are announced
+                    // on completion instead (below).
+                    if cfg.progress && thread_count == 1 {
+                        eprintln!(
+                            "hearth: [{}/{}] {} ({})",
+                            i + 1,
+                            n_total,
+                            blob.name,
+                            if blob.size_bytes > 0 {
+                                human_bytes(blob.size_bytes)
+                            } else {
+                                "size unknown".to_string()
+                            }
+                        );
+                    }
+
                     // slot == i means every blob gets a unique temp suffix,
                     // even if two blobs have the same sanitised name.
                     let outcome = fetch_blob_with_slot(blob, &worker_cfg, i);
 
                     match outcome {
                         Ok((path, bytes, cached)) => {
+                            if cfg.progress && thread_count == 1 && cached {
+                                // The banner above already named the part, so
+                                // this only has to explain why no bar appeared.
+                                eprintln!(
+                                    "hearth: [{}/{}] already on disk, skipped",
+                                    i + 1,
+                                    n_total
+                                );
+                            }
                             if cfg.progress && thread_count > 1 {
                                 // One clear line per completed part. [i+1/total]
                                 // so the operator can see forward progress
@@ -467,6 +607,11 @@ fn fetch_blobs_parallel(
                                     );
                                 }
                             }
+                            // Feed the heartbeat: bytes are attributed on
+                            // COMPLETION, and in-flight bytes come from the
+                            // filesystem, so the two never double-count.
+                            done_bytes.fetch_add(bytes, Ordering::Relaxed);
+                            done_parts.fetch_add(1, Ordering::Relaxed);
                             results.lock().unwrap().push((i, path, bytes, cached));
                         }
                         Err(e) => {
@@ -485,6 +630,10 @@ fn fetch_blobs_parallel(
             });
         }
     });
+
+    // Stop the heartbeat as soon as the workers are joined, or it would print
+    // one more line after the run has finished.
+    stop.store(true, Ordering::Relaxed);
 
     // Take the error before the results; if both are set the error wins.
     if let Some(e) = first_error.lock().unwrap().take() {
@@ -630,11 +779,13 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
 
     // Multi-blob path: fetch in parallel with bounded concurrency.
     //
-    // Per-blob announcement lines (the "[2/5] name (size)" header) are emitted
-    // by fetch_blobs_parallel itself after each part finishes — not before it
-    // starts — because in parallel mode the start order is non-deterministic
-    // and printing a start banner for each blob while others are already
-    // downloading would produce confusing interleaved output.
+    // Per-blob announcement lines are emitted by fetch_blobs_parallel, and
+    // WHEN depends on the concurrency it settles on:
+    //   * one worker  → "[2/5] name (size)" BEFORE the transfer, so the live
+    //     curl bar underneath it has a filename attached.
+    //   * many workers → "[2/5] name — 8.1 GiB done" AFTER each part, because
+    //     start order is non-deterministic and N start banners racing N
+    //     in-flight transfers is noise; the aggregate heartbeat covers the gap.
     let raw_results = fetch_blobs_parallel(&fetched.blobs, cfg, n)?;
 
     // Re-index by original position so weights detection and cached_all are
@@ -1301,6 +1452,36 @@ mod tests {
             assert_eq!(*len, parts[i].len() as u64);
             assert_eq!(std::fs::read(path).unwrap(), parts[i]);
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    // ---- heartbeat accounting ----
+
+    #[test]
+    fn partial_bytes_counts_only_in_flight_transfers() {
+        // The heartbeat's whole claim is that in-flight bytes come from the
+        // DISK and finished bytes come from the workers, so the two never
+        // double-count. That only holds if this function ignores committed
+        // blobs — otherwise a finished part is counted twice and the operator
+        // watches the total sail past 100%.
+        let dir = std::env::temp_dir().join("hearth-partial-bytes");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Nothing there yet, and an unreadable dir, both read as zero rather
+        // than as an error: a monitor thread must never fail a download.
+        assert_eq!(partial_bytes(&dir), 0);
+        assert_eq!(partial_bytes(&dir.join("does-not-exist")), 0);
+
+        std::fs::write(dir.join("sha256-aa.partial"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("name-1.unverified.partial"), vec![0u8; 25]).unwrap();
+        // A committed blob — already attributed via done_bytes, so counting it
+        // here would be the double-count.
+        std::fs::write(dir.join("sha256-bb"), vec![0u8; 9_000]).unwrap();
+        // A name that merely CONTAINS "partial" but does not end in it.
+        std::fs::write(dir.join("partial-notes.txt"), vec![0u8; 7]).unwrap();
+
+        assert_eq!(partial_bytes(&dir), 125);
 
         std::fs::remove_dir_all(&dir).ok();
     }
