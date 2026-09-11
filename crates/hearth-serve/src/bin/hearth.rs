@@ -548,6 +548,35 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
         out.model,
         out.weights_path.display()
     );
+
+    // The fleet.conf line, ready to paste. `hearth serve` above is the
+    // one-off; fleet.conf is how the model actually gets run, and hand-writing
+    // the directive means hand-copying a path — which for a sharded model is
+    // where the wrong path (the content-addressed blob, which loads one shard)
+    // used to get pasted in.
+    //
+    // Syntax is `model NAME=/abs/path.gguf:GIB[@CTX]` — see scripts/start.sh.
+    //
+    // The GIB field is a VRAM BUDGET, not a file size, and it is the knob that
+    // caused the KV-cache incident, so it is NOT guessed here. What is printed
+    // is the weights size, stated as the FLOOR it cannot go below, because
+    // budgeting for weights alone and forgetting KV is exactly how a card gets
+    // taken by a cache nothing declared.
+    let weights_gib = gib.ceil().max(1.0) as u64;
+    println!();
+    println!("  fleet.conf — paste this, then set the VRAM budget:");
+    println!(
+        "    model {}={}:{}",
+        out.model,
+        out.weights_path.display(),
+        weights_gib
+    );
+    println!(
+        "  the :{weights_gib} is a VRAM BUDGET in GiB and {weights_gib} is only the weights \
+         ({gib:.2} GiB rounded up) —"
+    );
+    println!("  raise it to cover KV cache too, which is ctx x parallel per model.");
+    println!("  on a multi-card box add:   devices {}=0,1", out.model);
     Ok(())
 }
 
