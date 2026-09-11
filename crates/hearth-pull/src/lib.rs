@@ -27,7 +27,7 @@ pub mod runtime;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hearth_core::sha256;
 use hearth_resolve::Reference;
@@ -389,6 +389,24 @@ fn partial_bytes(blobs_dir: &Path) -> u64 {
         .sum()
 }
 
+/// Bytes THIS run actually transferred, given the bytes on hand.
+///
+/// Extracted and tested because this arithmetic has been wrong twice. The
+/// first version divided every byte on hand by the monitor's elapsed time, so
+/// a resumed 7-part pull announced **15.56 GiB/s** on its first tick — 77.86
+/// GiB of already-present bytes over 5 seconds of monitor life. A progress
+/// line that can print a physically impossible number is worse than no
+/// progress line: it teaches the operator to distrust the honest fields next
+/// to it.
+///
+/// Two classes of byte are on hand without having been moved by this run:
+/// parts that were already complete (`cached`), and `.partial` bytes that
+/// existed when the monitor started (`resume_baseline`). Saturating throughout
+/// because a monitor thread must never be the thing that panics a download.
+fn transferred_this_run(have: u64, cached: u64, resume_baseline: u64) -> u64 {
+    have.saturating_sub(cached).saturating_sub(resume_baseline)
+}
+
 fn fetch_blobs_parallel(
     blobs: &[Blob],
     cfg: &PullConfig,
@@ -451,6 +469,10 @@ fn fetch_blobs_parallel(
     // means it reports real progress even though curl is a blocking subprocess
     // this process cannot poll.
     let done_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Tracked apart from `done_bytes` because a cached part is bytes on hand
+    // but NOT bytes this run transferred, and conflating the two is what made
+    // the rate figure lie.
+    let cached_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let done_parts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let total_expected: u64 = blobs.iter().map(|b| b.size_bytes).sum();
@@ -459,6 +481,7 @@ fn fetch_blobs_parallel(
         if cfg.progress && thread_count > 1 {
             let blobs_dir = cfg.blobs_dir.clone();
             let done_bytes = Arc::clone(&done_bytes);
+            let cached_bytes = Arc::clone(&cached_bytes);
             let done_parts = Arc::clone(&done_parts);
             let stop = Arc::clone(&stop);
             let n = blobs.len();
@@ -477,8 +500,18 @@ fn fetch_blobs_parallel(
                 const SLICE: Duration = Duration::from_millis(100);
                 let slices = (EVERY.as_millis() / SLICE.as_millis()).max(1);
                 let every_secs = EVERY.as_secs();
-                let started = Instant::now();
-                let mut last = 0u64;
+                // Bytes sitting in `.partial` files BEFORE this run started —
+                // a resumed transfer can begin with tens of gigabytes already
+                // on disk. The first version divided every byte on hand by the
+                // monitor's own elapsed time, so a resumed 7-part pull reported
+                // 15.56 GiB/s on its first tick: 77.86 GiB of pre-existing
+                // bytes over 5 seconds of monitor life. No link moves that. A
+                // rate figure that can print a physically impossible number is
+                // worse than no rate figure, because it teaches the operator to
+                // distrust the whole line.
+                let resume_baseline = partial_bytes(&blobs_dir);
+                // Bytes actually moved by THIS run, as of the previous tick.
+                let mut last_moved = 0u64;
                 loop {
                     for _ in 0..slices {
                         if stop.load(Ordering::Relaxed) {
@@ -491,31 +524,50 @@ fn fetch_blobs_parallel(
                     }
                     let in_flight = partial_bytes(&blobs_dir);
                     let finished = done_bytes.load(Ordering::Relaxed);
+                    let cached = cached_bytes.load(Ordering::Relaxed);
+                    // What is on hand toward the goal. Cached parts belong here
+                    // — they really are bytes the operator no longer has to
+                    // wait for — which is exactly why they must NOT feed the
+                    // rate.
                     let have = finished + in_flight;
                     let parts = done_parts.load(Ordering::Relaxed);
-                    let secs = started.elapsed().as_secs_f64().max(0.001);
-                    let rate = have as f64 / secs;
-                    // A rate of zero over a whole interval is the signal that
-                    // matters most, so it is stated rather than left to be
-                    // inferred from an unchanging byte count.
-                    let moved = have.saturating_sub(last);
-                    last = have;
+
+                    // What THIS run moved: drop the parts that were already
+                    // complete on disk, and the partial bytes that were already
+                    // there when the monitor started. A part that resumes counts
+                    // its full length in `finished` once it lands, so
+                    // subtracting the baseline stays correct across that
+                    // transition rather than double-discounting it.
+                    let moved_total = transferred_this_run(have, cached, resume_baseline);
+                    // WINDOWED, not cumulative-average. The average lags a link
+                    // that degrades mid-transfer, and "what is moving right now"
+                    // is the only rate an operator can act on. A rate of zero
+                    // over a whole interval is the signal that matters most, so
+                    // it is stated rather than left to be inferred from a byte
+                    // count that stopped changing.
+                    let window = moved_total.saturating_sub(last_moved);
+                    last_moved = moved_total;
+                    let rate = window / every_secs.max(1);
+
                     let of_total = if total_expected > 0 {
                         format!(" / {}", human_bytes(total_expected))
                     } else {
                         String::new()
                     };
-                    if moved == 0 {
+                    // "2/7 parts" was read as "working on part 2 of 7", i.e. as
+                    // evidence the pull had gone sequential. It means two are
+                    // FINISHED while the rest are in flight, so it says so.
+                    if window == 0 {
                         eprintln!(
-                            "hearth: {parts}/{n} parts · {}{of_total} · NO BYTES in the last \
+                            "hearth: {parts}/{n} parts done · {}{of_total} · NO BYTES in the last \
                              {every_secs}s — transfer may be stalled",
                             human_bytes(have)
                         );
                     } else {
                         eprintln!(
-                            "hearth: {parts}/{n} parts · {}{of_total} · {}/s",
+                            "hearth: {parts}/{n} parts done · {}{of_total} · {}/s",
                             human_bytes(have),
-                            human_bytes(rate as u64)
+                            human_bytes(rate)
                         );
                     }
                 }
@@ -528,6 +580,7 @@ fn fetch_blobs_parallel(
             let results = Arc::clone(&results);
             let worker_cfg = Arc::clone(&worker_cfg);
             let done_bytes = Arc::clone(&done_bytes);
+            let cached_bytes = Arc::clone(&cached_bytes);
             let done_parts = Arc::clone(&done_parts);
 
             s.spawn(move || {
@@ -611,6 +664,10 @@ fn fetch_blobs_parallel(
                             // COMPLETION, and in-flight bytes come from the
                             // filesystem, so the two never double-count.
                             done_bytes.fetch_add(bytes, Ordering::Relaxed);
+                            if cached {
+                                // On hand, but this run did not move it.
+                                cached_bytes.fetch_add(bytes, Ordering::Relaxed);
+                            }
                             done_parts.fetch_add(1, Ordering::Relaxed);
                             results.lock().unwrap().push((i, path, bytes, cached));
                         }
@@ -1484,5 +1541,28 @@ mod tests {
         assert_eq!(partial_bytes(&dir), 125);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn a_resumed_pull_does_not_report_a_rate_no_link_can_achieve() {
+        // The exact figure reported from a live 7-part GLM pull: parts already
+        // on disk, 77.86 GiB on hand, and the first heartbeat tick announced
+        // 15.56 GiB/s — which is just 77.86 / 5s. Nothing had moved yet; every
+        // byte was already there.
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let have = 77 * GIB + 881_000_000;
+        assert_eq!(transferred_this_run(have, have, 0), 0, "cached-only");
+        assert_eq!(transferred_this_run(have, 0, have), 0, "resume-only");
+
+        // A genuine 2 GiB of movement on top of a 40 GiB resumed baseline
+        // reads as 2 GiB, not 42.
+        assert_eq!(transferred_this_run(42 * GIB, 0, 40 * GIB), 2 * GIB);
+        // Cached and resumed bytes both discounted, once each.
+        assert_eq!(transferred_this_run(50 * GIB, 30 * GIB, 15 * GIB), 5 * GIB);
+
+        // Saturating: a blob removed mid-flight can make `have` shrink below
+        // the baseline, and a monitor underflowing to 18 exabytes per second
+        // would be a worse lie than the one being fixed.
+        assert_eq!(transferred_this_run(0, 0, 99 * GIB), 0);
+        assert_eq!(transferred_this_run(GIB, 99 * GIB, 99 * GIB), 0);
     }
 }
