@@ -80,6 +80,10 @@ pub struct Plan {
     pub admitted: Vec<String>,
     /// Models that do not fit, each with what it needed.
     pub rejected: Vec<Rejection>,
+    /// Held back from planning. Surfaced so "why is 272 refused on a 277 box"
+    /// is answerable from the message instead of from the source.
+    pub reserve_bytes: u64,
+    pub total_bytes: u64,
     pub committed_bytes: u64,
     pub usable_bytes: u64,
 }
@@ -90,6 +94,13 @@ pub struct Rejection {
     pub needed_bytes: u64,
     /// How much room was left when we got to it.
     pub free_bytes: u64,
+    /// The two halves of `needed_bytes`, kept apart because they are not
+    /// equally adjustable. Weights are fixed by the quant on disk; KV is a
+    /// consequence of ctx and parallel, which the operator can change in one
+    /// line. "needs 280.2 GiB" sends them looking for a bigger card; "272.0
+    /// weights + 8.2 KV" sends them to `ctx`.
+    pub weights_bytes: u64,
+    pub kv_bytes: u64,
 }
 
 impl Rejection {
@@ -117,13 +128,36 @@ impl Plan {
             gib(self.usable_bytes),
         );
         for r in &self.rejected {
+            // Show the ARITHMETIC, not just the verdict. A refusal the
+            // operator cannot reproduce on paper is indistinguishable from a
+            // bug, and this planner refusing a 271 GiB model is the feature
+            // working — but only if it says why.
             out.push_str(&format!(
-                "\n  REJECTED {} — needs {:.1} GiB, {:.1} GiB free, short by {:.1} GiB",
+                "\n  REJECTED {} — short by {:.2} GiB\
+                 \n    weights {:.2} + KV {:.2} = {:.2} GiB needed, {:.2} GiB free\
+                 \n    usable {:.2} = total {:.2} - {:.2} reserve",
                 r.model,
+                gib(r.short_bytes()),
+                gib(r.weights_bytes),
+                gib(r.kv_bytes),
                 gib(r.needed_bytes),
                 gib(r.free_bytes),
-                gib(r.short_bytes()),
+                gib(self.usable_bytes),
+                gib(self.total_bytes),
+                gib(self.reserve_bytes),
             ));
+            // Point at the knob that is actually adjustable. KV dominating
+            // means ctx/parallel; weights dominating means a smaller quant.
+            if r.kv_bytes > r.short_bytes() {
+                out.push_str(
+                    "\n    KV alone covers the shortfall — halve ctx or parallel and it fits",
+                );
+            } else {
+                out.push_str(
+                    "\n    weights alone exceed the budget — raise total_gib if the card has \
+                     it, else a smaller quant",
+                );
+            }
         }
         out
     }
@@ -184,6 +218,8 @@ pub fn plan(budget: Budget, declared: &[Declared]) -> Plan {
                 model: d.model.clone(),
                 needed_bytes: need,
                 free_bytes: free,
+                weights_bytes: d.weights_bytes,
+                kv_bytes: d.kv_bytes,
             });
         }
     }
@@ -193,6 +229,8 @@ pub fn plan(budget: Budget, declared: &[Declared]) -> Plan {
         rejected,
         committed_bytes: committed,
         usable_bytes: usable,
+        reserve_bytes: budget.reserve_bytes,
+        total_bytes: budget.total_bytes,
     }
 }
 
@@ -290,6 +328,7 @@ fn one_declared(v: &serde_json::Value) -> Result<Declared, String> {
 #[cfg(test)]
 mod ctx_tests {
     use super::total_ctx_tokens;
+    use super::{plan, Budget, Declared, GIB};
 
     #[test]
     fn explicit_ctx_is_already_the_total() {
@@ -316,5 +355,51 @@ mod ctx_tests {
     #[test]
     fn explicit_ctx_ignores_parallel_entirely() {
         assert_eq!(total_ctx_tokens(1024, 999_999, 64), 1024);
+    }
+    #[test]
+    fn a_refusal_shows_the_arithmetic_and_names_the_adjustable_knob() {
+        // The real case: 2x H200 NVL, a 271.79 GiB Q6_K model, ctx 8192.
+        // The operator saw only "refused by the VRAM budget at declaration"
+        // and could not tell a correct refusal from a bug, nor which of
+        // total_gib / ctx / quant would fix it. Every number below already
+        // existed on Rejection; none of it was printed.
+        let budget = Budget {
+            total_bytes: 277 * GIB,
+            reserve_bytes: 2 * GIB,
+        };
+        let declared = vec![Declared {
+            model: "glm-5.3-flash".into(),
+            weights_bytes: 272 * GIB,
+            kv_bytes: 8 * GIB,
+        }];
+        let p = plan(budget, &declared);
+        assert!(!p.fits(), "272 + 8 must not fit in 275 usable");
+
+        let e = p.explain();
+        // The split is the point: weights are fixed by the quant, KV is a
+        // consequence of ctx and parallel.
+        assert!(e.contains("weights 272.00"), "{e}");
+        assert!(e.contains("KV 8.00"), "{e}");
+        assert!(e.contains("280.00 GiB needed"), "{e}");
+        // And the reserve, or "why is 272 refused on a 277 box" is
+        // unanswerable without reading the source.
+        assert!(e.contains("usable 275.00"), "{e}");
+        assert!(e.contains("2.00 reserve"), "{e}");
+        // KV (8) exceeds the shortfall (5), so ctx is the knob that fixes it.
+        assert!(e.contains("halve ctx or parallel"), "{e}");
+
+        // Weights alone over budget is a DIFFERENT remedy, and must not be
+        // reported as a ctx problem — halving ctx there is wasted effort.
+        let too_fat = vec![Declared {
+            model: "huge".into(),
+            weights_bytes: 400 * GIB,
+            kv_bytes: GIB,
+        }];
+        let e2 = plan(budget, &too_fat).explain();
+        assert!(e2.contains("smaller quant"), "{e2}");
+        assert!(
+            !e2.contains("halve ctx"),
+            "a model whose weights alone blow the budget is not a ctx problem: {e2}"
+        );
     }
 }

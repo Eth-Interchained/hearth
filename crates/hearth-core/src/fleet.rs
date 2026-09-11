@@ -108,6 +108,7 @@ impl Route {
 #[derive(Debug, Clone)]
 pub struct Fleet {
     budget: Budget,
+    plan: Plan,
     slots: Vec<Slot>,
 }
 
@@ -129,7 +130,17 @@ impl Fleet {
                 }
             })
             .collect();
-        Fleet { budget, slots }
+        Fleet {
+            budget,
+            slots,
+            plan: p,
+        }
+    }
+
+    /// The plan this fleet was declared under, so callers can print the
+    /// arithmetic behind a refusal instead of only its verdict.
+    pub fn plan(&self) -> &Plan {
+        &self.plan
     }
 
     pub fn budget(&self) -> Budget {
