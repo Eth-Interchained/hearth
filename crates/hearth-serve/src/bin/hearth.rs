@@ -572,10 +572,17 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
         weights_gib
     );
     println!(
-        "  the :{weights_gib} is a VRAM BUDGET in GiB and {weights_gib} is only the weights \
-         ({gib:.2} GiB rounded up) —"
+        "  the :{weights_gib} is the WEIGHTS size in GiB ({gib:.2} rounded up). Do NOT add KV \
+         to it —"
     );
-    println!("  raise it to cover KV cache too, which is ctx x parallel per model.");
+    println!(
+        "  the planner adds KV itself, sized from the GGUF shape x ctx x parallel, on top of \
+         this number."
+    );
+    println!(
+        "  admission needs  weights + KV <= total_gib - 2  (the 2 GiB reserve covers CUDA \
+         context and fragmentation)."
+    );
     println!("  on a multi-card box add:   devices {}=0,1", out.model);
     Ok(())
 }
