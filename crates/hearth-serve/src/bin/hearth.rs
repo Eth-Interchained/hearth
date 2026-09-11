@@ -677,6 +677,18 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
     install_signal_handlers();
     let sup = Arc::new(Mutex::new(Supervisor::new(open_spine()?, budget, declared)));
 
+    // Print the plan's arithmetic whenever anything was refused. The numbers
+    // already existed on `Rejection`; nothing surfaced them, so the operator
+    // saw only "refused by the VRAM budget at declaration" and had no way to
+    // tell a correct refusal from a bug — or to know which knob would fix it.
+    {
+        let s = sup.lock().unwrap();
+        let plan = s.fleet().plan();
+        if !plan.fits() {
+            eprintln!("hearth: {}", plan.explain());
+        }
+    }
+
     // Start only what the budget admitted. Anything refused stays declared and
     // visible — /residency reports it with the exact shortfall, rather than it
     // silently not existing.
