@@ -511,6 +511,13 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
         .find(|a| !a.starts_with("--"))
         .ok_or("usage: hearth pull REFERENCE   (e.g. tinyllama, ollama:library/llama3:latest, file:./muse.gguf)")?;
 
+    // Flag beats env beats default — the same precedence as every other tunable
+    // in hearth. The env var lets operators set a permanent policy (e.g.
+    // HEARTH_PARALLEL_DOWNLOADS=1 on a metered satellite link) while the flag
+    // lets a single run override it without touching the environment.
+    let parallel_downloads: usize =
+        tunable(args, "--parallel-downloads", "HEARTH_PARALLEL_DOWNLOADS", 4);
+
     let cfg = hearth_pull::PullConfig {
         blobs_dir: match flag(args, "--blobs") {
             Some(d) => d.into(),
@@ -519,6 +526,7 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
         // A silent multi-gigabyte pause is indistinguishable from a hang.
         progress: !args.iter().any(|a| a == "--quiet"),
         verify_existing: args.iter().any(|a| a == "--verify-existing"),
+        parallel_downloads,
     };
 
     let spine = open_spine()?;

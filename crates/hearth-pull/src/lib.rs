@@ -46,6 +46,16 @@ pub struct PullConfig {
     /// Off by default: re-hashing 40 GiB on every start is a real cost, and the
     /// filename IS the digest. On when you have reason to distrust the disk.
     pub verify_existing: bool,
+    /// How many blobs to fetch simultaneously. Flag `--parallel-downloads` wins,
+    /// then env `HEARTH_PARALLEL_DOWNLOADS`, then this default.
+    ///
+    /// Default 4 is deliberately conservative: a 40-part sharded model with
+    /// concurrency=40 would saturate a spinning disk with random writes from 40
+    /// separate curl processes and turn a metered connection hostile. Four gives
+    /// real parallelism on a fast NVMe link while remaining polite on HDDs and
+    /// capped connections. Set 1 to recover the original sequential behaviour
+    /// exactly.
+    pub parallel_downloads: usize,
 }
 
 impl Default for PullConfig {
@@ -54,6 +64,7 @@ impl Default for PullConfig {
             blobs_dir: PathBuf::from("./blobs"),
             progress: true,
             verify_existing: false,
+            parallel_downloads: 4,
         }
     }
 }
@@ -157,10 +168,22 @@ fn digest_file_loud(path: &Path, label: &str, progress: bool) -> Result<String, 
 /// matches. Without that, an interrupted transfer leaves a file whose *name*
 /// claims a digest its *contents* do not have — and every later run trusts the
 /// name. The rename is the commit.
+///
+/// `slot` disambiguates the temp path for the self-verified (no published
+/// digest) case when multiple workers run in parallel. Sequential callers
+/// always pass 0.
 pub fn fetch_blob(blob: &Blob, cfg: &PullConfig) -> Result<(PathBuf, u64, bool), String> {
+    fetch_blob_with_slot(blob, cfg, 0)
+}
+
+fn fetch_blob_with_slot(
+    blob: &Blob,
+    cfg: &PullConfig,
+    slot: usize,
+) -> Result<(PathBuf, u64, bool), String> {
     match &blob.digest {
         Some(digest) => fetch_blob_verified(blob, digest, cfg),
-        None => fetch_blob_self_verified(blob, cfg),
+        None => fetch_blob_self_verified(blob, cfg, slot),
     }
 }
 
@@ -243,7 +266,14 @@ fn fetch_blob_verified(
 /// nothing about whether the content is what the operator meant to fetch.
 /// Callers that need real verification pin a digest — the URL scheme's
 /// `#sha256:HEX` fragment exists for exactly that.
-fn fetch_blob_self_verified(blob: &Blob, cfg: &PullConfig) -> Result<(PathBuf, u64, bool), String> {
+///
+/// `slot` is appended to the temp filename to prevent collisions when multiple
+/// parallel workers download blobs that happen to share a sanitised name.
+fn fetch_blob_self_verified(
+    blob: &Blob,
+    cfg: &PullConfig,
+    slot: usize,
+) -> Result<(PathBuf, u64, bool), String> {
     std::fs::create_dir_all(&cfg.blobs_dir).map_err(|e| e.to_string())?;
     let safe_name = blob
         .name
@@ -256,9 +286,12 @@ fn fetch_blob_self_verified(blob: &Blob, cfg: &PullConfig) -> Result<(PathBuf, u
             }
         })
         .collect::<String>();
+    // The slot suffix ensures two parallel workers fetching blobs with the
+    // same sanitised name — rare but possible for bare-URL pulls — write to
+    // different temp files and do not clobber each other's partial downloads.
     let partial = cfg
         .blobs_dir
-        .join(format!("{safe_name}.unverified.partial"));
+        .join(format!("{safe_name}-{slot}.unverified.partial"));
 
     download_to(&partial, blob, cfg)?;
 
@@ -303,6 +336,165 @@ fn download_to(dest: &Path, blob: &Blob, cfg: &PullConfig) -> Result<(), String>
     };
     curl::fetch_file(&req, cfg.progress).map_err(|e| e.0)?;
     Ok(())
+}
+
+/// Fetch a slice of blobs in parallel, honouring `cfg.parallel_downloads`.
+///
+/// Returns a vec of `(original_index, path, bytes, was_cached)` in
+/// completion order (not input order). The caller must sort or index by
+/// `original_index` when insertion order matters.
+///
+/// **Progress discipline**: N concurrent curl progress bars interleaved on
+/// one terminal is unreadable garbage. When `parallel_downloads > 1` each
+/// worker fetches silently and emits a single structured line when it
+/// finishes: `hearth: [3/5] name — 8.1 GiB done`. That gives the operator
+/// clear forward progress without the mush. The single-blob path (`== 1`)
+/// is untouched and keeps its live progress meter.
+///
+/// **Failure discipline**: the first error from any worker is captured and
+/// returned, naming both the part index and the blob name so the operator
+/// knows which of the N in-flight parts went wrong. Other workers are
+/// allowed to finish their current blob (stopping mid-curl is not cleaner
+/// than finishing), but no new work is started once an error is recorded.
+///
+/// **Temp-path safety**: `fetch_blob_verified` writes to `sha256-<digest>.partial`,
+/// unique per digest by construction. `fetch_blob_self_verified` writes to
+/// `<name>-<slot>.unverified.partial`, where slot is the blob's position in
+/// the input slice — also unique, even if two blobs share a sanitised name.
+/// `(original index, path on disk, bytes, was it already cached)`.
+///
+/// Named because clippy is right that the bare tuple-in-Arc-in-Mutex is
+/// unreadable at a call site, and because the ORDER of these fields is load
+/// bearing: the index is first precisely so results can be re-sorted into
+/// input order after finishing out of order.
+type FetchOutcome = (usize, PathBuf, u64, bool);
+
+fn fetch_blobs_parallel(
+    blobs: &[Blob],
+    cfg: &PullConfig,
+    n_total: usize,
+) -> Result<Vec<FetchOutcome>, String> {
+    use std::sync::{Arc, Mutex};
+
+    if blobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // The actual thread count: bounded by both the limit and the work.
+    // This also handles parallel_downloads == 1 — one worker, same as the
+    // old sequential loop, but still going through this function for code
+    // simplicity. The caller keeps the single-blob branch for exact parity.
+    let thread_count = cfg.parallel_downloads.min(blobs.len()).max(1);
+
+    // When running in parallel (> 1 thread), each worker suppresses curl's
+    // per-part progress meter and the per-part hash meter. Mixed-progress
+    // output from N concurrent curl processes on one terminal is unreadable;
+    // the workers emit a single completion line instead (see below). The outer
+    // cfg.progress flag still governs whether ANY output is produced.
+    let worker_cfg = if thread_count > 1 {
+        // Progress off inside workers; the completion banner below takes over.
+        Arc::new(PullConfig {
+            progress: false,
+            ..cfg.clone()
+        })
+    } else {
+        Arc::new(cfg.clone())
+    };
+
+    // A global offset into the blob slice that each worker advances atomically.
+    // Simpler than a channel or a Mutex<VecDeque> — each worker just keeps
+    // claiming the next unclaimed index.
+    let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // First error from any worker. Only the first is kept — if five parts are
+    // in flight and three fail, the first failure is the one to act on; the
+    // rest are likely cascading from the same root cause.
+    let first_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let results: Arc<Mutex<Vec<FetchOutcome>>> =
+        Arc::new(Mutex::new(Vec::with_capacity(blobs.len())));
+
+    std::thread::scope(|s| {
+        for _ in 0..thread_count {
+            let next_idx = Arc::clone(&next_idx);
+            let first_error = Arc::clone(&first_error);
+            let results = Arc::clone(&results);
+            let worker_cfg = Arc::clone(&worker_cfg);
+
+            s.spawn(move || {
+                loop {
+                    // If a peer already failed, stop starting new work. The
+                    // peer's curl process will finish its current chunk —
+                    // there is no portable way to kill a subprocess mid-flight
+                    // that is cleaner than letting it run — but we do not
+                    // start fresh blobs.
+                    if first_error.lock().unwrap().is_some() {
+                        break;
+                    }
+
+                    let i = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= blobs.len() {
+                        break;
+                    }
+
+                    let blob = &blobs[i];
+                    // slot == i means every blob gets a unique temp suffix,
+                    // even if two blobs have the same sanitised name.
+                    let outcome = fetch_blob_with_slot(blob, &worker_cfg, i);
+
+                    match outcome {
+                        Ok((path, bytes, cached)) => {
+                            if cfg.progress && thread_count > 1 {
+                                // One clear line per completed part. [i+1/total]
+                                // so the operator can see forward progress
+                                // without interleaved curl noise. The "already
+                                // on disk" branch matches the sequential path's
+                                // wording.
+                                if cached {
+                                    eprintln!(
+                                        "hearth: [{}/{}] {} — already on disk",
+                                        i + 1,
+                                        n_total,
+                                        blob.name
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "hearth: [{}/{}] {} — {} done",
+                                        i + 1,
+                                        n_total,
+                                        blob.name,
+                                        human_bytes(bytes)
+                                    );
+                                }
+                            }
+                            results.lock().unwrap().push((i, path, bytes, cached));
+                        }
+                        Err(e) => {
+                            // Name the part prominently. "download failed" when
+                            // five parts were in flight tells the operator
+                            // nothing about which one to retry.
+                            let msg =
+                                format!("part [{}/{}] {} failed: {}", i + 1, n_total, blob.name, e);
+                            let mut guard = first_error.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(msg);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // Take the error before the results; if both are set the error wins.
+    if let Some(e) = first_error.lock().unwrap().take() {
+        return Err(e);
+    }
+
+    Ok(Arc::try_unwrap(results)
+        .expect("all threads finished")
+        .into_inner()
+        .unwrap())
 }
 
 /// Pull a model reference, recording the whole thing in the spine.
@@ -367,21 +559,31 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
     // assume is stuck; and on a multi-part model it is the only way to know
     // that a meter reaching 100.0% is part one of three, not the end.
     let n = fetched.blobs.len();
+    let concurrency = cfg.parallel_downloads.min(n).max(1);
     if cfg.progress {
         let total: u64 = fetched.blobs.iter().map(|b| b.size_bytes).sum();
-        eprintln!(
-            "hearth: {n} file(s), {} to fetch — then a sha256 verify of each",
-            human_bytes(total)
-        );
+        if concurrency > 1 {
+            eprintln!(
+                "hearth: {n} file(s), {} to fetch — downloading up to {concurrency} in parallel, \
+                 then a sha256 verify of each",
+                human_bytes(total)
+            );
+        } else {
+            eprintln!(
+                "hearth: {n} file(s), {} to fetch — then a sha256 verify of each",
+                human_bytes(total)
+            );
+        }
     }
 
-    let mut weights: Option<(PathBuf, u64)> = None;
-    let mut cached_all = true;
-    for (i, blob) in fetched.blobs.iter().enumerate() {
+    // Single-blob path: identical to the original sequential code. Progress
+    // meters and all output are unchanged — no reason to pay the parallel
+    // machinery overhead or suppress the live curl bar for one file.
+    if n == 1 {
+        let blob = &fetched.blobs[0];
         if cfg.progress {
             eprintln!(
-                "hearth: [{}/{n}] {} ({})",
-                i + 1,
+                "hearth: [1/1] {} ({})",
                 blob.name,
                 if blob.size_bytes > 0 {
                     human_bytes(blob.size_bytes)
@@ -390,14 +592,70 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
                 }
             );
         }
-        let (path, len, cached) = fetch_blob(blob, cfg)?;
+        let (path, bytes, cached) = fetch_blob(blob, cfg)?;
         if cfg.progress && cached {
-            eprintln!("hearth: [{}/{n}] already on disk, skipped", i + 1);
+            eprintln!("hearth: [1/1] already on disk, skipped");
         }
+
+        let (weights_path, bytes) = if blob.is_weights {
+            (path, bytes)
+        } else {
+            return Err(format!(
+                "{model} resolved with no weights layer — 1 blob, not the model"
+            ));
+        };
+
+        spine
+            .record(
+                &model,
+                &Transition::PullCompleted {
+                    path: weights_path.display().to_string(),
+                    size_bytes: bytes,
+                },
+                &[EventRef {
+                    hash: started.hash,
+                    seq: started.seq,
+                }],
+            )
+            .map_err(|e| format!("could not record completion: {e}"))?;
+
+        return Ok(Pulled {
+            model,
+            source,
+            weights_path,
+            bytes,
+            already_had_it: cached,
+        });
+    }
+
+    // Multi-blob path: fetch in parallel with bounded concurrency.
+    //
+    // Per-blob announcement lines (the "[2/5] name (size)" header) are emitted
+    // by fetch_blobs_parallel itself after each part finishes — not before it
+    // starts — because in parallel mode the start order is non-deterministic
+    // and printing a start banner for each blob while others are already
+    // downloading would produce confusing interleaved output.
+    let raw_results = fetch_blobs_parallel(&fetched.blobs, cfg, n)?;
+
+    // Re-index by original position so weights detection and cached_all are
+    // in-order regardless of which thread finished first.
+    let mut outcomes = vec![None::<(PathBuf, u64, bool)>; n];
+    for (i, path, bytes, cached) in raw_results {
+        outcomes[i] = Some((path, bytes, cached));
+    }
+
+    let mut weights: Option<(PathBuf, u64)> = None;
+    let mut cached_all = true;
+    for (i, slot) in outcomes.into_iter().enumerate() {
+        let (path, len, cached) = slot.ok_or_else(|| {
+            // Should be unreachable: fetch_blobs_parallel guarantees every
+            // index is covered or returns an Err. Guard defensively.
+            format!("internal error: blob {i} has no result after parallel fetch")
+        })?;
         if !cached {
             cached_all = false;
         }
-        if blob.is_weights {
+        if fetched.blobs[i].is_weights {
             weights = Some((path, len));
         }
     }
@@ -436,6 +694,8 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- existing tests, unchanged ----
 
     #[test]
     fn a_blob_path_is_its_digest_so_presence_is_a_stat() {
@@ -497,6 +757,7 @@ mod tests {
             blobs_dir: blobs.clone(),
             progress: false,
             verify_existing: false,
+            parallel_downloads: 1,
         };
         let blob = Blob {
             name: "weights".into(),
@@ -536,6 +797,7 @@ mod tests {
             blobs_dir: blobs.clone(),
             progress: false,
             verify_existing: false,
+            parallel_downloads: 1,
         };
         let blob = Blob {
             name: "weights".into(),
@@ -577,6 +839,7 @@ mod tests {
             blobs_dir: blobs.clone(),
             progress: false,
             verify_existing: false,
+            parallel_downloads: 1,
         };
         let blob = Blob {
             name: "weights".into(),
@@ -612,6 +875,7 @@ mod tests {
             blobs_dir: blobs.clone(),
             progress: false,
             verify_existing: false,
+            parallel_downloads: 1,
         };
         let blob = Blob {
             name: "model.gguf".into(),
@@ -633,8 +897,9 @@ mod tests {
             expected_name,
             "the final path must be the digest hearth computed, not a guess"
         );
+        // slot 0 is used by the public fetch_blob wrapper
         assert!(
-            !blobs.join("model.gguf.unverified.partial").exists(),
+            !blobs.join("model.gguf-0.unverified.partial").exists(),
             "the working file must not survive under its temporary name"
         );
 
@@ -659,6 +924,7 @@ mod tests {
             blobs_dir: blobs.clone(),
             progress: false,
             verify_existing: false,
+            parallel_downloads: 1,
         };
         let blob = Blob {
             name: "model.gguf".into(),
@@ -696,6 +962,7 @@ mod tests {
             blobs_dir: blobs.clone(),
             progress: false,
             verify_existing: false,
+            parallel_downloads: 1,
         };
         let blob = Blob {
             name: "../../etc/model.gguf".into(),
@@ -712,6 +979,328 @@ mod tests {
             "the final path must stay under blobs_dir, got {}",
             path.display()
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- new tests for parallel download feature ----
+
+    /// `parallel_downloads` is the tunable that governs concurrency. The
+    /// default of 4 is a deliberate compromise: enough parallelism to matter on
+    /// a fast NVMe link, polite enough not to thrash an HDD or a metered
+    /// connection. The value must round-trip through the config struct so the
+    /// CLI and the env-var plumbing can set it.
+    /// Sequential vs parallel, against a REAL HTTP server, measured.
+    ///
+    /// `#[ignore]` because it needs a server on 127.0.0.1:8731 and six part
+    /// files — CI has neither, and a test that silently passes when its
+    /// fixture is absent is worse than no test. Run it deliberately:
+    ///
+    /// ```text
+    /// python3 /tmp/slowserve.py &          # sleeps 1s per request
+    /// cargo test -p hearth-pull -- --ignored --nocapture parallel_is_actually_faster
+    /// ```
+    ///
+    /// The server sleeps per request on purpose. A localhost transfer is too
+    /// fast for scheduling to show above the noise, so this measures whether
+    /// the workers OVERLAP. It deliberately does NOT claim to prove bandwidth
+    /// saturation on a real network — that is a different experiment and this
+    /// one cannot speak to it.
+    #[test]
+    #[ignore]
+    fn parallel_is_actually_faster_against_a_real_server() {
+        let dir = std::env::temp_dir().join("hearth-parallel-bench");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mk = |n: usize| Blob {
+            name: format!("part-{n}.bin"),
+            url: format!("http://127.0.0.1:8731/part-{n}.bin"),
+            digest: None,
+            size_bytes: 0,
+            headers: vec![],
+            is_weights: n == 1,
+        };
+        let blobs: Vec<Blob> = (1..=6).map(mk).collect();
+
+        let run = |workers: usize| -> std::time::Duration {
+            let blobs_dir = dir.join(format!("w{workers}"));
+            let _ = std::fs::remove_dir_all(&blobs_dir);
+            let cfg = PullConfig {
+                blobs_dir,
+                progress: false,
+                verify_existing: false,
+                parallel_downloads: workers,
+            };
+            let t = std::time::Instant::now();
+            let got = fetch_blobs_parallel(&blobs, &cfg, blobs.len())
+                .unwrap_or_else(|e| panic!("fetch with {workers} worker(s) failed: {e}"));
+            assert_eq!(got.len(), 6, "every part must arrive");
+            t.elapsed()
+        };
+
+        let seq = run(1);
+        let par = run(4);
+        println!("  sequential (1 worker): {:.2}s", seq.as_secs_f64());
+        println!("  parallel   (4 workers): {:.2}s", par.as_secs_f64());
+        println!("  speedup: {:.2}x", seq.as_secs_f64() / par.as_secs_f64());
+
+        // Six requests at ~1s each: ~6s sequential, ~2s at concurrency 4.
+        // The bar is deliberately loose (just "meaningfully faster") because a
+        // tight threshold on a shared CI box is a flaky test, and a flaky test
+        // teaches people to ignore failures.
+        assert!(
+            par < seq.mul_f64(0.6),
+            "parallel ({:.2}s) should be well under sequential ({:.2}s)",
+            par.as_secs_f64(),
+            seq.as_secs_f64()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parallel_downloads_default_is_four_and_is_configurable() {
+        let cfg = PullConfig::default();
+        assert_eq!(
+            cfg.parallel_downloads, 4,
+            "default 4: real parallelism without thrashing a spinning disk or metered link"
+        );
+        let single = PullConfig {
+            parallel_downloads: 1,
+            ..PullConfig::default()
+        };
+        assert_eq!(single.parallel_downloads, 1);
+    }
+
+    /// Two workers fetching blobs whose sanitised names are identical must not
+    /// clobber each other's temp files. The slot suffix in the temp filename is
+    /// the guard: slot 0 writes `name-0.unverified.partial`, slot 1 writes
+    /// `name-1.unverified.partial`. This test proves the invariant without a
+    /// network — both blobs are served by local file:// URLs.
+    #[test]
+    fn parallel_temp_paths_are_unique_per_slot_even_with_identical_blob_names() {
+        let dir = std::env::temp_dir().join("hearth-pull-slot-collision");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let body_a = b"part one contents";
+        let body_b = b"part two contents";
+        let served_a = dir.join("part_a.bin");
+        let served_b = dir.join("part_b.bin");
+        std::fs::write(&served_a, body_a).unwrap();
+        std::fs::write(&served_b, body_b).unwrap();
+
+        let blobs = dir.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+
+        // Both blobs intentionally share the same name — the worst case for
+        // temp-path collision if the slot suffix were absent.
+        let cfg = PullConfig {
+            blobs_dir: blobs.clone(),
+            progress: false,
+            verify_existing: false,
+            parallel_downloads: 1,
+        };
+
+        // Fetch slot 0 and slot 1 sequentially to simulate what parallel workers do.
+        let blob_a = Blob {
+            name: "model.gguf".into(),
+            url: format!("file://{}", served_a.display()),
+            digest: None,
+            size_bytes: 0,
+            headers: vec![],
+            is_weights: true,
+        };
+        let blob_b = Blob {
+            name: "model.gguf".into(),
+            url: format!("file://{}", served_b.display()),
+            digest: None,
+            size_bytes: 0,
+            headers: vec![],
+            is_weights: false,
+        };
+
+        // Use fetch_blob_with_slot directly to prove the slot suffix lands.
+        let (path_a, ..) = fetch_blob_with_slot(&blob_a, &cfg, 0).unwrap();
+        let (path_b, ..) = fetch_blob_with_slot(&blob_b, &cfg, 1).unwrap();
+
+        // Different content → different digests → different final paths.
+        assert_ne!(
+            path_a, path_b,
+            "distinct content must land in distinct content-addressed paths"
+        );
+        // Neither temp file should survive.
+        assert!(!blobs.join("model.gguf-0.unverified.partial").exists());
+        assert!(!blobs.join("model.gguf-1.unverified.partial").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A digest mismatch in one part of a parallel pull must fail the whole
+    /// pull AND name the part, so the operator knows which of N in-flight
+    /// downloads went wrong. "download failed" across five parts is useless;
+    /// "part [3/5] model-00003-of-00005.gguf failed: digest mismatch" is not.
+    #[test]
+    fn a_parallel_digest_mismatch_names_the_failing_part() {
+        let dir = std::env::temp_dir().join("hearth-pull-parallel-mismatch");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Three blobs: first and last are fine, middle is corrupt.
+        let good_body = b"correct weights";
+        let bad_body = b"tampered weights";
+
+        let served_good = dir.join("good.bin");
+        let served_bad = dir.join("bad.bin");
+        std::fs::write(&served_good, good_body).unwrap();
+        std::fs::write(&served_bad, bad_body).unwrap();
+
+        let blobs = dir.join("blobs");
+        let cfg = PullConfig {
+            blobs_dir: blobs.clone(),
+            progress: false,
+            verify_existing: false,
+            parallel_downloads: 3,
+        };
+
+        let good_digest = sha256::hex_digest(good_body);
+        // A digest nothing on disk will ever satisfy. THIS IS THE WHOLE POINT
+        // OF THE TEST AND THE FIRST VERSION GOT IT WRONG: it gave all three
+        // blobs the SAME digest, and because storage is content-addressed,
+        // blob 0 wrote `sha256-<good>` and blobs 1 and 2 then found that path
+        // already present and skipped downloading entirely. The corrupt part
+        // was never fetched, so nothing could reject it, and the test failed
+        // claiming the code was broken when the code was right. A corrupt part
+        // must claim a digest that is NOT already on disk, or content-addressing
+        // correctly short-circuits it.
+        let unsatisfiable = sha256::hex_digest(b"a digest no served body produces");
+
+        let blobs_list = vec![
+            Blob {
+                name: "model-00001-of-00003.gguf".into(),
+                url: format!("file://{}", served_good.display()),
+                digest: Some(good_digest.clone()),
+                size_bytes: good_body.len() as u64,
+                headers: vec![],
+                is_weights: false,
+            },
+            Blob {
+                // The corrupt part: served content hashes to neither digest.
+                name: "model-00002-of-00003.gguf".into(),
+                url: format!("file://{}", served_bad.display()),
+                digest: Some(unsatisfiable),
+                size_bytes: good_body.len() as u64,
+                headers: vec![],
+                is_weights: true,
+            },
+            Blob {
+                name: "model-00003-of-00003.gguf".into(),
+                url: format!("file://{}", served_good.display()),
+                digest: Some(good_digest.clone()),
+                size_bytes: good_body.len() as u64,
+                headers: vec![],
+                is_weights: false,
+            },
+        ];
+
+        let err = fetch_blobs_parallel(&blobs_list, &cfg, 3).unwrap_err();
+
+        // The error must name the offending part. The exact index may vary if
+        // threads finish out of order, but the blob name is deterministic.
+        assert!(
+            err.contains("model-00002-of-00003.gguf"),
+            "error must name the failing part, got: {err}"
+        );
+        assert!(
+            err.contains("digest mismatch"),
+            "error must explain why it failed, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The single-blob path (n == 1) must behave identically to the pre-parallel
+    /// code: same return value, same caching semantics, no regression.
+    #[test]
+    fn single_blob_parallel_path_is_unchanged() {
+        let dir = std::env::temp_dir().join("hearth-pull-single-blob-parallel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = b"one file, no sharding needed";
+        let served = dir.join("model.bin");
+        std::fs::write(&served, body).unwrap();
+
+        let blobs = dir.join("blobs");
+        let cfg = PullConfig {
+            blobs_dir: blobs.clone(),
+            progress: false,
+            verify_existing: false,
+            parallel_downloads: 4, // non-1 limit, but only one blob
+        };
+        let blob_list = vec![Blob {
+            name: "model.gguf".into(),
+            url: format!("file://{}", served.display()),
+            digest: Some(sha256::hex_digest(body)),
+            size_bytes: body.len() as u64,
+            headers: vec![],
+            is_weights: true,
+        }];
+
+        let results = fetch_blobs_parallel(&blob_list, &cfg, 1).unwrap();
+        assert_eq!(results.len(), 1);
+        let (idx, path, len, cached) = &results[0];
+        assert_eq!(*idx, 0);
+        assert!(!cached);
+        assert_eq!(*len, body.len() as u64);
+        assert_eq!(std::fs::read(path).unwrap(), body);
+
+        // Second call: cached.
+        let results2 = fetch_blobs_parallel(&blob_list, &cfg, 1).unwrap();
+        assert!(results2[0].3, "second call must be a cache hit");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `fetch_blobs_parallel` with concurrency 2 fetches three blobs correctly,
+    /// all verified and placed under their content-addressed paths. This is the
+    /// core multi-part model scenario.
+    #[test]
+    fn three_blobs_with_concurrency_two_all_arrive_and_are_verified() {
+        let dir = std::env::temp_dir().join("hearth-pull-three-parts");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let parts: Vec<Vec<u8>> = vec![
+            b"shard one content".to_vec(),
+            b"shard two content".to_vec(),
+            b"shard three content".to_vec(),
+        ];
+        let mut blob_list = Vec::new();
+        for (i, body) in parts.iter().enumerate() {
+            let served = dir.join(format!("part{i}.bin"));
+            std::fs::write(&served, body).unwrap();
+            blob_list.push(Blob {
+                name: format!("model-{:05}-of-00003.gguf", i + 1),
+                url: format!("file://{}", served.display()),
+                digest: Some(sha256::hex_digest(body)),
+                size_bytes: body.len() as u64,
+                headers: vec![],
+                is_weights: i == 0,
+            });
+        }
+
+        let blobs = dir.join("blobs");
+        let cfg = PullConfig {
+            blobs_dir: blobs.clone(),
+            progress: false,
+            verify_existing: false,
+            parallel_downloads: 2,
+        };
+
+        let mut results = fetch_blobs_parallel(&blob_list, &cfg, 3).unwrap();
+        results.sort_by_key(|r| r.0);
+        assert_eq!(results.len(), 3);
+        for (i, (idx, path, len, cached)) in results.iter().enumerate() {
+            assert_eq!(*idx, i);
+            assert!(!cached);
+            assert_eq!(*len, parts[i].len() as u64);
+            assert_eq!(std::fs::read(path).unwrap(), parts[i]);
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
