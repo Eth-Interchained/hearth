@@ -891,6 +891,40 @@ fn fetch_blobs_parallel(
         .unwrap())
 }
 
+/// Is this the FIRST shard of a split GGUF?
+///
+/// llama.cpp's own convention, `-%05d-of-%05d.gguf`. Matched on the literal
+/// `-00001-of-` rather than parsed, because that is exactly the substring
+/// llama.cpp rewrites to find the rest.
+fn is_first_shard(name: &str) -> bool {
+    name.contains("-00001-of-")
+}
+
+/// Which blob is the ENTRY POINT llama.cpp must be handed.
+///
+/// This is not "any blob that is weights". Every part of a sharded HuggingFace
+/// model is marked `is_weights` (registry.rs), so code that merely kept the
+/// last match handed back part SEVEN of seven:
+///
+/// ```text
+/// model …=/root/.hearth/models/…/GLM-5.3-Flash-UD-Q6_K_XL-00007-of-00007.gguf:44
+/// ```
+///
+/// which loads one shard of a 271.79 GiB model. The bug is quiet in the worst
+/// way: the path exists, the file is a valid GGUF, and the failure surfaces
+/// later as a model that is missing most of its tensors.
+///
+/// So the first shard is chosen EXPLICITLY when one is named, and only then
+/// does it fall back to the first weights blob by position. Relying on input
+/// order alone would make correctness depend on how a registry happened to
+/// sort its tree listing.
+fn entry_part_index(blobs: &[Blob]) -> Option<usize> {
+    blobs
+        .iter()
+        .position(|b| b.is_weights && is_first_shard(&b.name))
+        .or_else(|| blobs.iter().position(|b| b.is_weights))
+}
+
 /// Where the original-name view of a model's blobs lives.
 ///
 /// Derived from the blobs dir's parent, so `~/.hearth/blobs` yields
@@ -939,8 +973,10 @@ fn link_original_names(
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create the model dir {}: {e}", dir.display()))?;
 
+    // Resolved BEFORE the loop so the answer cannot depend on iteration order.
+    let entry = entry_part_index(blobs);
     let mut part_one: Option<PathBuf> = None;
-    for (blob, blob_file) in blobs.iter().zip(blob_files.iter()) {
+    for (i, (blob, blob_file)) in blobs.iter().zip(blob_files.iter()).enumerate() {
         let link = dir.join(safe_blob_name(&blob.name));
 
         // Idempotent: a re-pull must not fail because the last one worked. A
@@ -949,7 +985,7 @@ fn link_original_names(
         // silently loads the wrong weights.
         match std::fs::read_link(&link) {
             Ok(existing) if existing == *blob_file => {
-                if blob.is_weights {
+                if Some(i) == entry {
                     part_one = Some(link);
                 }
                 continue;
@@ -987,7 +1023,7 @@ fn link_original_names(
                 )
             })?;
         }
-        if blob.is_weights {
+        if Some(i) == entry {
             part_one = Some(link);
         }
     }
@@ -1149,6 +1185,11 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
     let mut weights: Option<(PathBuf, u64)> = None;
     let mut cached_all = true;
     let mut blob_files: Vec<PathBuf> = Vec::with_capacity(n);
+    // The size of the MODEL, not of whichever shard happened to be selected.
+    // Reporting one part's length made a 271.79 GiB pull announce "44 GiB",
+    // and that number is what the printed fleet.conf VRAM floor is derived
+    // from — so the floor was understated by a factor of six.
+    let mut model_bytes: u64 = 0;
     for (i, slot) in outcomes.into_iter().enumerate() {
         let (path, len, cached) = slot.ok_or_else(|| {
             // Should be unreachable: fetch_blobs_parallel guarantees every
@@ -1158,13 +1199,14 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
         if !cached {
             cached_all = false;
         }
-        if fetched.blobs[i].is_weights {
+        model_bytes = model_bytes.saturating_add(len);
+        if Some(i) == entry_part_index(&fetched.blobs) {
             weights = Some((path.clone(), len));
         }
         blob_files.push(path);
     }
 
-    let (_part_one_blob, bytes) = weights.ok_or_else(|| {
+    let (_part_one_blob, _entry_len) = weights.ok_or_else(|| {
         format!(
             "{model} resolved with no weights layer — the registry returned \
              {} blob(s), none of them the model",
@@ -1175,6 +1217,7 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
     // Hand back the ORIGINAL-NAME view, never the content-addressed blob.
     // llama.cpp derives parts 2..n from part one's filename, so `sha256-9f2c…`
     // loads one shard of a sharded model.
+    let bytes = model_bytes;
     let weights_path = link_original_names(&cfg.blobs_dir, &model, &fetched.blobs, &blob_files)?;
     if cfg.progress {
         eprintln!(
@@ -1829,7 +1872,7 @@ mod tests {
         // The heartbeat's accounting claim is that in-flight bytes come from
         // the DISK and finished bytes come from the workers, so the two never
         // double-count. Two ways that breaks, both asserted here.
-        let dir = std::env::temp_dir().join("hearth-partial-bytes");
+        let dir = std::env::temp_dir().join(format!("hearth-partial-bytes-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1899,7 +1942,8 @@ mod tests {
         // observed. This test observes nothing else, which is the point.
         use std::sync::mpsc;
 
-        let dir = std::env::temp_dir().join("hearth-parallel-terminates");
+        let dir =
+            std::env::temp_dir().join(format!("hearth-parallel-terminates-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1945,7 +1989,7 @@ mod tests {
         // exist. A content-addressed `sha256-…` has no pattern to rewrite:
         // that is how a fully verified 7-part 271.79 GiB pull produced a path
         // that loads one shard and fails as an apparent corrupt GGUF.
-        let dir = std::env::temp_dir().join("hearth-sharded-link");
+        let dir = std::env::temp_dir().join(format!("hearth-sharded-link-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let blobs_dir = dir.join("blobs");
         std::fs::create_dir_all(&blobs_dir).unwrap();
@@ -2025,5 +2069,72 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn the_entry_shard_is_part_one_even_though_every_part_is_weights() {
+        // THE REGRESSION. Every part of a sharded HuggingFace model is marked
+        // is_weights (registry.rs), so code that kept the LAST match printed
+        // this to a live operator:
+        //
+        //   model …/GLM-5.3-Flash-UD-Q6_K_XL-00007-of-00007.gguf:44
+        //
+        // Part SEVEN of seven, which is a valid GGUF containing one shard of a
+        // 271.79 GiB model. Quiet in the worst way: the path exists and the
+        // file parses.
+        let blobs: Vec<Blob> = (1..=7)
+            .map(|i| Blob {
+                name: format!("GLM-5.3-Flash-UD-Q6_K_XL-{i:05}-of-00007.gguf"),
+                url: String::new(),
+                digest: None,
+                size_bytes: 1,
+                headers: vec![],
+                is_weights: true,
+            })
+            .collect();
+        assert_eq!(entry_part_index(&blobs), Some(0), "must select part ONE");
+
+        // Order-independent: correctness cannot rest on how a registry sorted
+        // its tree listing.
+        let mut shuffled = blobs.clone();
+        shuffled.reverse();
+        let picked = entry_part_index(&shuffled).unwrap();
+        assert!(
+            is_first_shard(&shuffled[picked].name),
+            "picked {} from a reversed listing",
+            shuffled[picked].name
+        );
+
+        // Single-file model: no shard markers, so the only weights blob wins.
+        let single = vec![
+            Blob {
+                name: "params".into(),
+                url: String::new(),
+                digest: None,
+                size_bytes: 1,
+                headers: vec![],
+                is_weights: false,
+            },
+            Blob {
+                name: "model.gguf".into(),
+                url: String::new(),
+                digest: None,
+                size_bytes: 1,
+                headers: vec![],
+                is_weights: true,
+            },
+        ];
+        assert_eq!(entry_part_index(&single), Some(1));
+
+        // A non-weights blob must never be chosen, even if it looks like a
+        // first shard — a template layer named that way is not the model.
+        let decoy = vec![Blob {
+            name: "notes-00001-of-00002.txt".into(),
+            url: String::new(),
+            digest: None,
+            size_bytes: 1,
+            headers: vec![],
+            is_weights: false,
+        }];
+        assert_eq!(entry_part_index(&decoy), None);
     }
 }
