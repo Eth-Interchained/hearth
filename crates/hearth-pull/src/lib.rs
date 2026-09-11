@@ -732,6 +732,7 @@ fn fetch_blobs_parallel(
             });
         }
 
+        let mut workers = Vec::with_capacity(thread_count);
         for _ in 0..thread_count {
             let next_idx = Arc::clone(&next_idx);
             let first_error = Arc::clone(&first_error);
@@ -742,7 +743,7 @@ fn fetch_blobs_parallel(
             let done_parts = Arc::clone(&done_parts);
             let part_done = Arc::clone(&part_done);
 
-            s.spawn(move || {
+            workers.push(s.spawn(move || {
                 loop {
                     // If a peer already failed, stop starting new work. The
                     // peer's curl process will finish its current chunk —
@@ -847,13 +848,37 @@ fn fetch_blobs_parallel(
                         }
                     }
                 }
-            });
+            }));
         }
-    });
 
-    // Stop the heartbeat as soon as the workers are joined, or it would print
-    // one more line after the run has finished.
-    stop.store(true, Ordering::Relaxed);
+        // Join the WORKERS, then stop the monitor — both INSIDE the scope.
+        //
+        // This ordering is load bearing and its absence was a hard deadlock.
+        // `thread::scope` does not return until every thread it spawned has
+        // finished, the monitor included; the monitor loops until `stop` is
+        // set; and `stop` used to be set on the line AFTER the scope. So the
+        // scope waited on the monitor and the monitor waited on the scope. A
+        // real 271.79 GiB pull downloaded, hashed and committed all seven
+        // parts, printed `[7/7] … 43.62 GiB done`, and then repeated
+        // "verifying and committing the last part(s)" forever.
+        //
+        // The bytes were never at risk — every part was already renamed into
+        // its content-addressed home — but the process could not exit, so the
+        // spine never recorded the completion.
+        //
+        // It survived review because the probe that "verified" this code piped
+        // through `head` and ran under `timeout`: the OUTPUT was checked and
+        // TERMINATION never was. A concurrency change is not verified until a
+        // run has been watched all the way to its exit status.
+        for w in workers {
+            // A panicking worker must not leave the monitor spinning. The
+            // error paths below report whatever was captured.
+            if w.join().is_err() {
+                eprintln!("hearth: a download worker panicked — see the error above");
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
 
     // Take the error before the results; if both are set the error wins.
     if let Some(e) = first_error.lock().unwrap().take() {
@@ -864,6 +889,112 @@ fn fetch_blobs_parallel(
         .expect("all threads finished")
         .into_inner()
         .unwrap())
+}
+
+/// Where the original-name view of a model's blobs lives.
+///
+/// Derived from the blobs dir's parent, so `~/.hearth/blobs` yields
+/// `~/.hearth/models`. Falls back to a directory inside the blobs dir when it
+/// has no usable parent, which only happens for an exotic `--blobs` value and
+/// is better than refusing to pull over it.
+fn models_dir(blobs_dir: &Path) -> PathBuf {
+    match blobs_dir.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join("models"),
+        _ => blobs_dir.join("_models"),
+    }
+}
+
+/// Give a multi-part model back its ORIGINAL filenames, pointing at the
+/// content-addressed blobs.
+///
+/// Not cosmetic: without this a sharded model cannot be loaded at all.
+/// llama.cpp does not read a list of parts from anywhere — it derives the
+/// siblings of part one BY PATTERN, rewriting `…-00001-of-00007.gguf` into
+/// `…-00002-of-00007.gguf` and so on, relative to the file it was handed. A
+/// blob stored as `sha256-9f2c…` has no pattern to rewrite, so a 271.79 GiB
+/// seven-part pull verified every byte, committed every part, and handed back
+/// a path that loads one seventh of a model — failing later as what looks like
+/// a corrupt GGUF, three layers from the cause.
+///
+/// Content addressing is still what the blob store does — dedup and
+/// digest-as-name are why a re-pull is a `stat` — so the blobs stay exactly
+/// where they are and this directory is a VIEW onto them:
+///
+/// ```text
+/// ~/.hearth/models/<model>/GLM-…-00001-of-00007.gguf -> ../../blobs/sha256-…
+/// ```
+///
+/// Symlink first, because `ls -l` then shows which digest backs which part,
+/// and that is the provenance question this project exists to answer. Hard
+/// link as a fallback for platforms or filesystems that refuse symlinks.
+/// Never a copy: silently duplicating 271 GiB to paper over a link failure is
+/// a worse outcome than an error message.
+fn link_original_names(
+    blobs_dir: &Path,
+    model: &str,
+    blobs: &[Blob],
+    blob_files: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let dir = models_dir(blobs_dir).join(safe_blob_name(model));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create the model dir {}: {e}", dir.display()))?;
+
+    let mut part_one: Option<PathBuf> = None;
+    for (blob, blob_file) in blobs.iter().zip(blob_files.iter()) {
+        let link = dir.join(safe_blob_name(&blob.name));
+
+        // Idempotent: a re-pull must not fail because the last one worked. A
+        // link already pointing at the right blob is left alone; one pointing
+        // anywhere else is replaced, because a stale link is how a model
+        // silently loads the wrong weights.
+        match std::fs::read_link(&link) {
+            Ok(existing) if existing == *blob_file => {
+                if blob.is_weights {
+                    part_one = Some(link);
+                }
+                continue;
+            }
+            Ok(_) => {
+                std::fs::remove_file(&link).map_err(|e| {
+                    format!("could not replace the stale link {}: {e}", link.display())
+                })?;
+            }
+            Err(_) if link.exists() => {
+                // Present but not a symlink: a hard link from an earlier
+                // fallback, or a real file. Replaced rather than assumed
+                // correct — assuming is how the wrong weights get served.
+                std::fs::remove_file(&link)
+                    .map_err(|e| format!("could not replace {}: {e}", link.display()))?;
+            }
+            Err(_) => {}
+        }
+
+        #[cfg(unix)]
+        let symlinked = std::os::unix::fs::symlink(blob_file, &link);
+        #[cfg(not(unix))]
+        let symlinked = std::fs::hard_link(blob_file, &link);
+
+        if let Err(sym_err) = symlinked {
+            // Name BOTH causes when the fallback fails too. One speculative
+            // cause sends the operator after the wrong filesystem.
+            std::fs::hard_link(blob_file, &link).map_err(|hard_err| {
+                format!(
+                    "could not give {} its original name at {}: symlink failed ({sym_err}) \
+                     and hard link failed ({hard_err}). Without this, llama.cpp cannot find \
+                     parts 2..n of a sharded model.",
+                    blob.name,
+                    link.display()
+                )
+            })?;
+        }
+        if blob.is_weights {
+            part_one = Some(link);
+        }
+    }
+
+    part_one.ok_or_else(|| {
+        format!("{model}: no blob was marked as the weights layer, so there is no part one")
+    })
 }
 
 /// Pull a model reference, recording the whole thing in the spine.
@@ -1017,6 +1148,7 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
 
     let mut weights: Option<(PathBuf, u64)> = None;
     let mut cached_all = true;
+    let mut blob_files: Vec<PathBuf> = Vec::with_capacity(n);
     for (i, slot) in outcomes.into_iter().enumerate() {
         let (path, len, cached) = slot.ok_or_else(|| {
             // Should be unreachable: fetch_blobs_parallel guarantees every
@@ -1027,17 +1159,32 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
             cached_all = false;
         }
         if fetched.blobs[i].is_weights {
-            weights = Some((path, len));
+            weights = Some((path.clone(), len));
         }
+        blob_files.push(path);
     }
 
-    let (weights_path, bytes) = weights.ok_or_else(|| {
+    let (_part_one_blob, bytes) = weights.ok_or_else(|| {
         format!(
             "{model} resolved with no weights layer — the registry returned \
              {} blob(s), none of them the model",
             fetched.blobs.len()
         )
     })?;
+
+    // Hand back the ORIGINAL-NAME view, never the content-addressed blob.
+    // llama.cpp derives parts 2..n from part one's filename, so `sha256-9f2c…`
+    // loads one shard of a sharded model.
+    let weights_path = link_original_names(&cfg.blobs_dir, &model, &fetched.blobs, &blob_files)?;
+    if cfg.progress {
+        eprintln!(
+            "hearth: {n} part(s) linked under their original names in {}",
+            weights_path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+    }
 
     spine
         .record(
@@ -1735,5 +1882,148 @@ mod tests {
         // would be a worse lie than the one being fixed.
         assert_eq!(transferred_this_run(0, 0, 99 * GIB), 0);
         assert_eq!(transferred_this_run(GIB, 99 * GIB, 99 * GIB), 0);
+    }
+    #[test]
+    fn a_parallel_fetch_with_the_heartbeat_on_actually_terminates() {
+        // THE REGRESSION TEST THAT WAS MISSING.
+        //
+        // `thread::scope` does not return until every thread it spawned exits,
+        // monitor included. With `stop` set on the line AFTER the scope, the
+        // scope waited on the monitor and the monitor waited on the scope: a
+        // hard deadlock that appears ONLY with progress on and more than one
+        // worker. A real 271.79 GiB pull committed all seven parts and then
+        // hung forever.
+        //
+        // Every earlier check of this code inspected OUTPUT — piped through
+        // `head`, run under `timeout` — so termination was never once
+        // observed. This test observes nothing else, which is the point.
+        use std::sync::mpsc;
+
+        let dir = std::env::temp_dir().join("hearth-parallel-terminates");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Port 1 refuses instantly: every fetch fails fast. Failure is fine —
+        // the only question is whether the function RETURNS.
+        let blobs: Vec<Blob> = (0..3)
+            .map(|i| Blob {
+                name: format!("p{i}.bin"),
+                url: "http://127.0.0.1:1/nope".to_string(),
+                digest: None,
+                size_bytes: 1,
+                headers: vec![],
+                is_weights: i == 0,
+            })
+            .collect();
+        // progress: true is essential — with it off the monitor is never
+        // spawned and the deadlock cannot reproduce.
+        let cfg = PullConfig {
+            blobs_dir: dir.clone(),
+            progress: true,
+            verify_existing: false,
+            parallel_downloads: 2,
+        };
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(fetch_blobs_parallel(&blobs, &cfg, 3).is_ok());
+        });
+
+        if rx.recv_timeout(Duration::from_secs(60)).is_err() {
+            panic!(
+                "fetch_blobs_parallel did not return within 60s with progress on and 2 \
+                 workers — the heartbeat monitor is deadlocking the thread scope again"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sharded_model_gets_the_sibling_names_llama_cpp_derives() {
+        // llama.cpp finds parts 2..n by REWRITING part one's filename, so the
+        // path handed back must sit in a directory where those derived names
+        // exist. A content-addressed `sha256-…` has no pattern to rewrite:
+        // that is how a fully verified 7-part 271.79 GiB pull produced a path
+        // that loads one shard and fails as an apparent corrupt GGUF.
+        let dir = std::env::temp_dir().join("hearth-sharded-link");
+        std::fs::remove_dir_all(&dir).ok();
+        let blobs_dir = dir.join("blobs");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+
+        let names: Vec<String> = (1..=3)
+            .map(|i| format!("GLM-Q6-{i:05}-of-00003.gguf"))
+            .collect();
+        let mut blobs = Vec::new();
+        let mut files = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            let blob_file = blobs_dir.join(format!("sha256-deadbeef{i}"));
+            std::fs::write(&blob_file, format!("shard {i}")).unwrap();
+            blobs.push(Blob {
+                name: name.clone(),
+                url: String::new(),
+                digest: Some(format!("deadbeef{i}")),
+                size_bytes: 7,
+                headers: vec![],
+                is_weights: i == 0,
+            });
+            files.push(blob_file);
+        }
+
+        let part_one = link_original_names(&blobs_dir, "GLM-5.3-Flash", &blobs, &files).unwrap();
+
+        // Part one comes back under its ORIGINAL name, not its digest.
+        assert_eq!(part_one.file_name().unwrap(), names[0].as_str());
+        assert!(
+            !part_one.to_string_lossy().contains("sha256-"),
+            "handed back the content-addressed path, which loads one shard: {}",
+            part_one.display()
+        );
+
+        // The derivation llama.cpp performs must land on real files.
+        let home = part_one.parent().unwrap();
+        for name in &names {
+            let derived = home.join(name);
+            assert!(
+                derived.exists(),
+                "llama.cpp will derive {} and find nothing",
+                derived.display()
+            );
+        }
+        // And each one must resolve to its OWN shard, not all to part one.
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(
+                std::fs::read_to_string(home.join(name)).unwrap(),
+                format!("shard {i}"),
+                "{name} resolves to the wrong shard"
+            );
+        }
+        // The blobs themselves stay content-addressed — this is a view, not a
+        // move, and a 271 GiB copy would be a catastrophic regression.
+        for f in &files {
+            assert!(
+                f.exists(),
+                "blob was moved instead of linked: {}",
+                f.display()
+            );
+        }
+
+        // Idempotent: a re-pull must succeed, not trip over its own links.
+        let again = link_original_names(&blobs_dir, "GLM-5.3-Flash", &blobs, &files).unwrap();
+        assert_eq!(again, part_one);
+
+        // A STALE link — pointing at the wrong blob — must be replaced, not
+        // trusted. Serving the wrong weights silently is the worst outcome here.
+        let stale = home.join(&names[1]);
+        std::fs::remove_file(&stale).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&files[0], &stale).unwrap();
+        link_original_names(&blobs_dir, "GLM-5.3-Flash", &blobs, &files).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&stale).unwrap(),
+            "shard 1",
+            "a stale link was trusted — this serves the wrong weights"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
