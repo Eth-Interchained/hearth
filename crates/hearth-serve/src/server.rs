@@ -250,6 +250,39 @@ impl ServerChild {
     pub fn stderr_log(&self) -> PathBuf {
         self.spec.log_path("err")
     }
+
+    /// The last few lines the child said before dying.
+    ///
+    /// This method exists because `stderr_log()` did not have one caller.
+    /// hearth faithfully captured llama-server's stderr to a file and then
+    /// reported only "the serving process exited" — so the operator was told
+    /// their model died, was not told why, and was not even told the file
+    /// existed. The cause of a 271.79 GiB model failing to load was
+    /// `cudaMalloc failed: out of memory` sitting on disk, unmentioned,
+    /// through several rounds of guessing.
+    ///
+    /// Reads the tail only: a llama-server log is thousands of lines of
+    /// tensor metadata and the interesting part is always at the end.
+    pub fn last_words(&self, lines: usize) -> Option<String> {
+        tail_of(&self.stderr_log(), lines)
+    }
+}
+
+/// Last `lines` non-empty lines of a file, or None when there is nothing
+/// useful to show. Reads the whole file: a crash log is small, and doing this
+/// properly with seeks would be more code than the problem deserves.
+fn tail_of(path: &Path, lines: usize) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(lines)
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    Some(kept.into_iter().rev().collect::<Vec<_>>().join("\n"))
 }
 
 impl Drop for ServerChild {
@@ -538,5 +571,59 @@ mod production_defaults {
         assert_eq!(pair(&argv, "--port").as_deref(), Some("9001"));
         assert_eq!(pair(&argv, "--host").as_deref(), Some("127.0.0.1"));
         assert_eq!(pair(&argv, "-c").as_deref(), Some("8192"));
+    }
+    #[test]
+    fn a_dead_childs_last_words_are_the_tail_not_the_whole_log() {
+        // The real log that cost three rounds of misdiagnosis: thousands of
+        // lines of tensor metadata, and the answer in the last few. hearth
+        // captured all of it and surfaced none of it.
+        let dir = std::env::temp_dir().join(format!("hearth-lastwords-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("err.log");
+
+        let mut body = String::new();
+        for i in 0..3000 {
+            body.push_str(&format!("I load_tensors: layer {i} noise\n"));
+        }
+        body.push('\n'); // blank lines must not eat a slot in the tail
+        body.push_str(
+            "E llama_model_load: error loading model: unknown model architecture: 'glm5next'\n",
+        );
+        body.push_str("E srv  llama_server: exiting due to model loading error\n");
+        std::fs::write(&log, &body).unwrap();
+
+        let tail = tail_of(&log, 12).expect("a non-empty log must yield a tail");
+        // The cause must be present — that is the entire point.
+        assert!(
+            tail.contains("unknown model architecture: 'glm5next'"),
+            "the tail dropped the actual error: {tail}"
+        );
+        assert!(
+            tail.contains("exiting due to model loading error"),
+            "{tail}"
+        );
+        // And the 3000 lines of metadata must NOT be, or the operator is back
+        // to not reading it.
+        assert!(
+            tail.lines().count() <= 12,
+            "tail too long: {}",
+            tail.lines().count()
+        );
+        assert!(
+            !tail.contains("layer 0 noise"),
+            "tail reached the top of the log"
+        );
+        // Blank lines are skipped rather than consuming budget.
+        assert!(!tail.lines().any(|l| l.trim().is_empty()), "{tail}");
+
+        // A missing or empty log reports nothing rather than pretending. The
+        // caller distinguishes "no evidence" from "here is the evidence", and
+        // an empty string masquerading as a tail would be a quiet lie.
+        assert!(tail_of(&dir.join("nope.log"), 12).is_none());
+        std::fs::write(dir.join("empty.log"), "\n\n  \n").unwrap();
+        assert!(tail_of(&dir.join("empty.log"), 12).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -50,6 +50,14 @@ struct Managed {
 }
 
 /// The supervisor: fleet (decisions) + spine (record) + children (mechanism).
+/// How much of a dead child's stderr to echo.
+///
+/// A llama-server log is thousands of lines of tensor metadata and the cause
+/// is always in the last handful. Twelve covers the error plus the couple of
+/// lines of context that name which stage failed, without burying the
+/// operator in the noise that made them not read the file in the first place.
+const LAST_WORDS_LINES: usize = 12;
+
 pub struct Supervisor {
     fleet: Fleet,
     spine: Spine,
@@ -156,7 +164,41 @@ impl Supervisor {
                 let obs = match m.child.as_mut() {
                     None => continue, // stopped deliberately; nothing to watch
                     Some(child) => match child.exit_code() {
-                        Some(code) => Observation::ProcessExited { code },
+                        Some(code) => {
+                            // SAY WHY. The child's stderr was already captured
+                            // to a file, and `stderr_log()` had zero callers —
+                            // so hearth reported "the serving process exited"
+                            // while the actual cause sat on disk, unmentioned
+                            // and unnamed.
+                            //
+                            // It cost real time: a 271.79 GiB model failed with
+                            // `unknown model architecture: 'glm5next'`, which
+                            // is a five-second diagnosis, and instead three
+                            // rounds were spent theorising about VRAM budgets.
+                            // The model had died in 259 ms at metadata parse
+                            // without allocating a byte.
+                            //
+                            // Printed here rather than left to the residency
+                            // reason, because the reason string is a state
+                            // machine's vocabulary and this is evidence.
+                            eprintln!(
+                                "hearth: {model} exited (code {}) — stderr: {}",
+                                code.map(|c| c.to_string())
+                                    .unwrap_or_else(|| "signal".into()),
+                                child.stderr_log().display()
+                            );
+                            match child.last_words(LAST_WORDS_LINES) {
+                                Some(tail) => {
+                                    for line in tail.lines() {
+                                        eprintln!("hearth:   | {line}");
+                                    }
+                                }
+                                None => eprintln!(
+                                    "hearth:   | (its stderr log is empty or unreadable — the                                      child may have died before writing anything)"
+                                ),
+                            }
+                            Observation::ProcessExited { code }
+                        }
                         None => {
                             match probe::probe_http(&endpoint, "/health", self.probe_timeout) {
                                 ProbeResult::Ok => Observation::ProbeOk {
