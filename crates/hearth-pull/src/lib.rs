@@ -277,17 +277,7 @@ fn fetch_blob_self_verified(
     slot: usize,
 ) -> Result<(PathBuf, u64, bool), String> {
     std::fs::create_dir_all(&cfg.blobs_dir).map_err(|e| e.to_string())?;
-    let safe_name = blob
-        .name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
+    let safe_name = safe_blob_name(&blob.name);
     // The slot suffix ensures two parallel workers fetching blobs with the
     // same sanitised name — rare but possible for bare-URL pulls — write to
     // different temp files and do not clobber each other's partial downloads.
@@ -371,21 +361,52 @@ fn download_to(dest: &Path, blob: &Blob, cfg: &PullConfig) -> Result<(), String>
 /// input order after finishing out of order.
 type FetchOutcome = (usize, PathBuf, u64, bool);
 
-/// Bytes currently sitting in `.partial` files in the blobs dir.
+/// A blob name reduced to characters that are safe in a path.
+fn safe_blob_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Where a blob's in-flight bytes land, for a given worker slot.
+///
+/// THE SINGLE AUTHORITY on that question. The heartbeat has to read the same
+/// path the fetcher writes, and the first version guessed by scanning the
+/// directory for `*.partial` — which silently swept in leftovers from
+/// unrelated interrupted pulls and counted them as this model's progress.
+/// Deriving both sides from one function means the monitor cannot drift from
+/// the fetcher, and a foreign `.partial` is simply never consulted.
+fn partial_path_for(blobs_dir: &Path, blob: &Blob, slot: usize) -> PathBuf {
+    match &blob.digest {
+        Some(d) => blob_path(blobs_dir, d).with_extension("partial"),
+        None => blobs_dir.join(format!(
+            "{}-{slot}.unverified.partial",
+            safe_blob_name(&blob.name)
+        )),
+    }
+}
+
+/// Bytes sitting in the `.partial` file of each given part.
 ///
 /// The heartbeat measures the DISK rather than the workers, because curl is a
-/// blocking subprocess this process cannot poll for progress. Any read error is
-/// treated as zero for that entry: a monitor thread must never be the thing
-/// that fails a download, and an undercount shows up as a conservative number
-/// rather than a crash.
-fn partial_bytes(blobs_dir: &Path) -> u64 {
-    let rd = match std::fs::read_dir(blobs_dir) {
-        Ok(rd) => rd,
-        Err(_) => return 0,
-    };
-    rd.flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
-        .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+/// blocking subprocess this process cannot poll for progress. It is handed the
+/// exact set of paths belonging to THIS pull, rather than scanning the blobs
+/// directory: a leftover `.partial` from an unrelated interrupted pull would
+/// otherwise be counted as progress toward this model.
+///
+/// A missing file or any read error counts as zero for that entry. A monitor
+/// thread must never be the thing that fails a download, so an undercount is
+/// reported as a conservative number instead of raised as an error.
+fn partial_bytes(paths: &[PathBuf]) -> u64 {
+    paths
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
         .sum()
 }
 
@@ -477,14 +498,37 @@ fn fetch_blobs_parallel(
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let total_expected: u64 = blobs.iter().map(|b| b.size_bytes).sum();
 
+    // Per-part identity, expected size, and the exact path its bytes land in —
+    // computed once, up front, from the same authority the fetcher uses.
+    //
+    // This exists because "2/7 parts done" was a useless progress signal on a
+    // model whose parts are 38 GiB each: at ~35 MiB/s per stream a part
+    // crosses the line roughly once every twenty minutes, so the counter sat
+    // at 2/7 for two minutes of watching and read as a stalled sequential
+    // pull. It was neither stalled nor sequential. A counter that only moves
+    // when a 38 GiB file COMPLETES cannot show concurrency; four byte counts
+    // each climbing independently can, and needs no explaining.
+    let parts: Vec<(usize, u64, PathBuf)> = blobs
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (i, b.size_bytes, partial_path_for(&cfg.blobs_dir, b, i)))
+        .collect();
+    // Set as each part lands, so the monitor stops reporting it as in flight.
+    let part_done: Arc<Vec<std::sync::atomic::AtomicBool>> = Arc::new(
+        (0..blobs.len())
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
+            .collect(),
+    );
+
     std::thread::scope(|s| {
         if cfg.progress && thread_count > 1 {
-            let blobs_dir = cfg.blobs_dir.clone();
             let done_bytes = Arc::clone(&done_bytes);
             let cached_bytes = Arc::clone(&cached_bytes);
             let done_parts = Arc::clone(&done_parts);
+            let part_done = Arc::clone(&part_done);
             let stop = Arc::clone(&stop);
             let n = blobs.len();
+            let parts = parts.clone();
             s.spawn(move || {
                 // Five seconds: frequent enough that a stalled transfer is
                 // obvious within one screen, sparse enough that an hours-long
@@ -509,9 +553,18 @@ fn fetch_blobs_parallel(
                 // rate figure that can print a physically impossible number is
                 // worse than no rate figure, because it teaches the operator to
                 // distrust the whole line.
-                let resume_baseline = partial_bytes(&blobs_dir);
+                let all_partials: Vec<PathBuf> = parts.iter().map(|(_, _, p)| p.clone()).collect();
+                let resume_baseline = partial_bytes(&all_partials);
                 // Bytes actually moved by THIS run, as of the previous tick.
                 let mut last_moved = 0u64;
+                // Per-part byte count at the previous tick, so each part can
+                // report ITS OWN rate. That is the figure which answers
+                // whether concurrency is buying anything: four streams at
+                // 35 MiB/s summing to 140 means the origin caps per
+                // connection, and more workers would help; one stream at
+                // 140 with three idle means the link is the ceiling and the
+                // concurrency is theatre.
+                let mut last_part = vec![0u64; parts.len()];
                 loop {
                     for _ in 0..slices {
                         if stop.load(Ordering::Relaxed) {
@@ -522,7 +575,7 @@ fn fetch_blobs_parallel(
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
-                    let in_flight = partial_bytes(&blobs_dir);
+                    let in_flight = partial_bytes(&all_partials);
                     let finished = done_bytes.load(Ordering::Relaxed);
                     let cached = cached_bytes.load(Ordering::Relaxed);
                     // What is on hand toward the goal. Cached parts belong here
@@ -530,7 +583,7 @@ fn fetch_blobs_parallel(
                     // wait for — which is exactly why they must NOT feed the
                     // rate.
                     let have = finished + in_flight;
-                    let parts = done_parts.load(Ordering::Relaxed);
+                    let n_done = done_parts.load(Ordering::Relaxed);
 
                     // What THIS run moved: drop the parts that were already
                     // complete on disk, and the partial bytes that were already
@@ -549,25 +602,130 @@ fn fetch_blobs_parallel(
                     last_moved = moved_total;
                     let rate = window / every_secs.max(1);
 
+                    // Snapshot every in-flight part ONCE per tick: one stat
+                    // per part, reused for the classification, the aggregate
+                    // line and the per-part lines. Statting three times
+                    // invites the three readings to disagree mid-tick.
+                    //
+                    // A part is in flight when it is not yet committed and its
+                    // partial exists on disk.
+                    struct Live {
+                        idx: usize,
+                        got: u64,
+                        expected: u64,
+                        rate: u64,
+                    }
+                    let live: Vec<Live> = parts
+                        .iter()
+                        .filter(|(i, _, path)| {
+                            !part_done[*i].load(Ordering::Relaxed) && path.exists()
+                        })
+                        .map(|(i, expected, path)| {
+                            let got = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                            let rate = got.saturating_sub(last_part[*i]) / every_secs.max(1);
+                            last_part[*i] = got;
+                            Live {
+                                idx: *i,
+                                got,
+                                expected: *expected,
+                                rate,
+                            }
+                        })
+                        .collect();
+
+                    // Is anything actually TRANSFERRING? A part whose partial
+                    // has reached its expected size has finished curl and is
+                    // being sha256-hashed — and parallel mode silences the
+                    // per-worker hash meter, so minutes pass with no byte
+                    // movement on a perfectly healthy pull.
+                    //
+                    // The first version called that "NO BYTES — transfer may be
+                    // stalled". That is a false alarm on every multi-part pull,
+                    // at least once per part, and it was observed firing four
+                    // times in a row on a pull that was entirely fine. A stall
+                    // warning that cries wolf is worse than none: it trains the
+                    // operator to ignore the one case it exists to catch.
+                    //
+                    // Unknown expected size (`0`) counts as transferring, since
+                    // there is no size it could have reached.
+                    let hashing = live
+                        .iter()
+                        .filter(|l| l.expected > 0 && l.got >= l.expected)
+                        .count();
+                    let transferring = live.len() - hashing;
+
                     let of_total = if total_expected > 0 {
                         format!(" / {}", human_bytes(total_expected))
                     } else {
                         String::new()
                     };
-                    // "2/7 parts" was read as "working on part 2 of 7", i.e. as
+
+                    // `2/7 parts` was read as "working on part 2 of 7", i.e. as
                     // evidence the pull had gone sequential. It means two are
                     // FINISHED while the rest are in flight, so it says so.
-                    if window == 0 {
+                    if window > 0 {
                         eprintln!(
-                            "hearth: {parts}/{n} parts done · {}{of_total} · NO BYTES in the last \
-                             {every_secs}s — transfer may be stalled",
+                            "hearth: {n_done}/{n} parts done · {}{of_total} · {}/s",
+                            human_bytes(have),
+                            human_bytes(rate)
+                        );
+                    } else if transferring == 0 {
+                        // Nothing is moving because nothing is SUPPOSED to be
+                        // moving: every part on hand is complete and is being
+                        // hashed or committed. Say which, rather than reporting
+                        // a stall that is not happening.
+                        let what = if live.is_empty() {
+                            "verifying and committing the last part(s)".to_string()
+                        } else {
+                            format!("sha256-verifying {hashing} part(s), no transfer expected")
+                        };
+                        eprintln!(
+                            "hearth: {n_done}/{n} parts done · {}{of_total} · {what}",
                             human_bytes(have)
                         );
                     } else {
                         eprintln!(
-                            "hearth: {parts}/{n} parts done · {}{of_total} · {}/s",
-                            human_bytes(have),
-                            human_bytes(rate)
+                            "hearth: {n_done}/{n} parts done · {}{of_total} · NO BYTES in the last \
+                             {every_secs}s while {transferring} part(s) are still transferring \
+                             — may be stalled",
+                            human_bytes(have)
+                        );
+                    }
+
+                    // One line per part in flight. This is the whole point:
+                    // concurrency you can SEE. Four byte counts each climbing
+                    // on their own is self-evident in a way a completed-parts
+                    // counter on 38 GiB parts can never be.
+                    for (pos, l) in live.iter().enumerate() {
+                        let pct = if l.expected > 0 {
+                            format!("{:5.1}%", l.got as f64 / l.expected as f64 * 100.0)
+                        } else {
+                            "    ?".to_string()
+                        };
+                        let of = if l.expected > 0 {
+                            format!(" / {}", human_bytes(l.expected))
+                        } else {
+                            String::new()
+                        };
+                        // Last one gets the corner, so the group reads as a
+                        // group even when several pulls interleave in a log.
+                        let stem = if pos + 1 == live.len() {
+                            "└─"
+                        } else {
+                            "├─"
+                        };
+                        // A complete partial is being hashed, not stalled at
+                        // 0 B/s. Reporting a rate there invites exactly the
+                        // wrong conclusion.
+                        let tail = if l.expected > 0 && l.got >= l.expected {
+                            "sha256 …".to_string()
+                        } else {
+                            format!("{}/s", human_bytes(l.rate))
+                        };
+                        eprintln!(
+                            "hearth:   {stem} part {}/{n} · {}{of} · {pct} · {tail}",
+                            l.idx + 1,
+                            human_bytes(l.got)
                         );
                     }
                 }
@@ -582,6 +740,7 @@ fn fetch_blobs_parallel(
             let done_bytes = Arc::clone(&done_bytes);
             let cached_bytes = Arc::clone(&cached_bytes);
             let done_parts = Arc::clone(&done_parts);
+            let part_done = Arc::clone(&part_done);
 
             s.spawn(move || {
                 loop {
@@ -668,6 +827,10 @@ fn fetch_blobs_parallel(
                                 // On hand, but this run did not move it.
                                 cached_bytes.fetch_add(bytes, Ordering::Relaxed);
                             }
+                            // Stop the monitor reporting this part as in
+                            // flight. Set BEFORE done_parts so the two can
+                            // never disagree in a way that double-counts.
+                            part_done[i].store(true, Ordering::Relaxed);
                             done_parts.fetch_add(1, Ordering::Relaxed);
                             results.lock().unwrap().push((i, path, bytes, cached));
                         }
@@ -1515,30 +1678,38 @@ mod tests {
     // ---- heartbeat accounting ----
 
     #[test]
-    fn partial_bytes_counts_only_in_flight_transfers() {
-        // The heartbeat's whole claim is that in-flight bytes come from the
-        // DISK and finished bytes come from the workers, so the two never
-        // double-count. That only holds if this function ignores committed
-        // blobs — otherwise a finished part is counted twice and the operator
-        // watches the total sail past 100%.
+    fn partial_bytes_only_counts_the_parts_of_this_pull() {
+        // The heartbeat's accounting claim is that in-flight bytes come from
+        // the DISK and finished bytes come from the workers, so the two never
+        // double-count. Two ways that breaks, both asserted here.
         let dir = std::env::temp_dir().join("hearth-partial-bytes");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Nothing there yet, and an unreadable dir, both read as zero rather
-        // than as an error: a monitor thread must never fail a download.
-        assert_eq!(partial_bytes(&dir), 0);
-        assert_eq!(partial_bytes(&dir.join("does-not-exist")), 0);
+        let mine = vec![
+            dir.join("sha256-aa.partial"),
+            dir.join("name-1.unverified.partial"),
+        ];
 
-        std::fs::write(dir.join("sha256-aa.partial"), vec![0u8; 100]).unwrap();
-        std::fs::write(dir.join("name-1.unverified.partial"), vec![0u8; 25]).unwrap();
-        // A committed blob — already attributed via done_bytes, so counting it
-        // here would be the double-count.
-        std::fs::write(dir.join("sha256-bb"), vec![0u8; 9_000]).unwrap();
-        // A name that merely CONTAINS "partial" but does not end in it.
-        std::fs::write(dir.join("partial-notes.txt"), vec![0u8; 7]).unwrap();
+        // Nothing written yet, and a path that cannot exist: both read as zero
+        // rather than as an error. A monitor thread must never be the thing
+        // that fails a download.
+        assert_eq!(partial_bytes(&mine), 0);
+        assert_eq!(partial_bytes(&[dir.join("nope/nope.partial")]), 0);
+        assert_eq!(partial_bytes(&[]), 0);
 
-        assert_eq!(partial_bytes(&dir), 125);
+        std::fs::write(&mine[0], vec![0u8; 100]).unwrap();
+        std::fs::write(&mine[1], vec![0u8; 25]).unwrap();
+        // A committed blob of this pull — already attributed via done_bytes,
+        // so counting it here would be the double-count.
+        std::fs::write(dir.join("sha256-aa"), vec![0u8; 9_000]).unwrap();
+        // A leftover `.partial` from an unrelated interrupted pull sharing the
+        // blobs directory. The earlier version scanned for `*.partial` and
+        // swept this in, reporting another model's abandoned bytes as progress
+        // toward this one. It is not in the path list, so it cannot be seen.
+        std::fs::write(dir.join("sha256-ff.partial"), vec![0u8; 500_000]).unwrap();
+
+        assert_eq!(partial_bytes(&mine), 125);
 
         std::fs::remove_dir_all(&dir).ok();
     }
